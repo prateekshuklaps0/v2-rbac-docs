@@ -321,3 +321,4 @@ The frontend design above assumes these backend capabilities. None block Phase 0
 - **D4 — Export**: CSV only, or also a printable/scoped report?
 - **D5 — Name resolution ownership** (appendix #4): backend-resolved vs frontend-resolved.
 ```
+<!--  -->
