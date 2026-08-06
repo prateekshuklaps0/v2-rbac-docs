@@ -20,6 +20,7 @@
 12. [Open Questions for Prateek](#12-open-questions-for-prateek)
 13. [Progress Log](#13-progress-log)
 14. [Stage & Sub-Stage Permissions (Per-Role Instance Scope)](#14-stage--sub-stage-permissions-per-role-instance-scope--2026-06-17)
+15. [Data Visibility — Whose Records You See](#15-data-visibility--whose-records-you-see--2026-08-06)
 
 ---
 
@@ -1006,6 +1007,7 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-04-09 | Super admin drawer focus fix | ✅ Complete | Fixed shared drawer focus-reset issue that blurred inputs while typing in module forms |
 | 2026-04-17 | v2 RBAC continuation alignment | ✅ Complete | Synced backend behavior with the working handoff: user form payload shape, helper endpoint response shape, and full org-module ancestry enforcement |
 | 2026-06-17 | Per-role stage/sub-stage permissions | ✅ Complete | New instance-level scope layer on top of action-key RBAC. See §14. Backend enforcement on change-stage (bulk + profile PATCH) and settings save; role-editor "Stage Access" tab. Migrations pending `npm run migrate`. |
+| 2026-08-06 | Data visibility keyed to role level | ✅ Complete | Third scope layer — WHOSE records you see. `users.role` ENUM removed as the org-wide test (it made every level-2 Team Lead an org-wide admin); replaced by `userService.isOrgWideActor` (level 6 = org owner). Lead list, applicants, archive, export, dashboard-v2, calendar, user-dashboard all aligned. See §15. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -2773,3 +2775,95 @@ Visibility of the User Management list (`listUsers`) went through three iteratio
 
 ### Doc discrepancy noted while implementing
 Earlier sections of this file (written 2026-04) describe v2 RBAC as *proposed/in-progress* and mark `usersController`/`rolesController` v1 flows as "to be rebuilt". In reality the v2 RBAC system (`src/v2/`, `rbacMiddleware.requireAction`, `org_modules`/`org_actions`/`role_actions`, controls API, audit logs) is **implemented and live** — consistent with the RBAC Developer FAQ `.docx`. Treat §1–§13 as historical analysis; the FAQ `.docx` + this §14 reflect the current implemented system.
+
+---
+
+## 15. Data Visibility — Whose Records You See — 2026-08-06
+
+### Where this sits
+This is the **third** scope layer, and it answers a different question from the other two:
+
+| Layer | Question | Mechanism |
+|---|---|---|
+| Action-key RBAC (§1–§13) | *May I use this feature at all?* | `role_actions` → `rbacMiddleware.requireAction` |
+| Stage permissions (§14) | *Which stage rows may I touch?* | `role_lead_stage_permissions` |
+| **Data visibility (this §)** | ***Whose* records do I see?** | role `level` + `user_reporting_managers` |
+
+A user can hold `leads.view` and still see zero leads — the action grants the page, this layer fills it.
+
+### The authority is role LEVEL — never `users.role`
+
+`users.role` is a **v1 leftover** that only records which portal a user signs into (`admin` / `super_admin` → admin portals, `student` → student portal, `counsellor` / `user` → dead v1 values). v2 RBAC ignores it, as already stated in FINAL DECISIONS above. There is a permanent note on the column in `be-anandi/src/models/User.js`.
+
+**Why this matters (the bug that forced this section).** Lead scoping used to read:
+
+```js
+const isAdmin = ['admin','super_admin'].includes(findUser?.role) && !isCounsellor;
+```
+
+Almost every admin-portal user carries `role = 'admin'` regardless of seniority, so a **level-2 Team Lead was indistinguishable from a level-6 org owner** and skipped scoping entirely. In org 12 that was 62 users (all Team Leads, Managers, GMs, Sales Heads) seeing all ~426k leads. Replaced by:
+
+```js
+// userService.js
+const ORG_OWNER_LEVEL = 6;
+const isOrgWideActor = async ({ userId, orgId, roleId = null }) => {
+  const context = await rbacService.getUserRbacContext({ userId, orgId, roleId });
+  return Number(context?.effectiveLevel) >= ORG_OWNER_LEVEL;
+};
+```
+
+`effectiveLevel` is `null` for a user with no roles, and `Number(null) >= 6` is false — so an unknown actor **fails closed** (scoped), never open.
+
+> `is_counsellor_role` is **not** a visibility flag. It marks a role as assignable-as-a-counsellor and drives the counsellor pickers (`counsellorController`, `advanceFilterService`, `userDashboard.service`) plus the post-login landing route. Do not flag roles to change what they can see — change their `level`.
+
+### The visible set
+
+Built by `userService.listUsersManagedByUser`. For an actor at level **N**, the union of:
+
+1. **Themselves** — `includeExistingUser: true`
+2. **Their reporting downline**, walked recursively through `user_reporting_managers` (BFS, `visitedIds` breaks cycles), with `capReportingByLevel: true` dropping anyone at level ≥ N *and* stopping the descent through them — otherwise a junior listed as a senior's reporting manager would inherit that senior's whole subtree
+3. **Everyone in the org strictly below level N** — `includeRoleHierarchy: true`
+
+Both level tests are **strictly below**, so **peers are never visible**: a Team Lead cannot see another Team Lead's records. This is the intended contract, confirmed with the POC and the reporting manager on 2026-08-06.
+
+`includeRoleHierarchy` / `capReportingByLevel` both **require `orgId` and `roleId`** and throw `400` without them — levels are per-org, and see the multi-role note below.
+
+### `roleId` is mandatory — the multi-role trap
+
+`getUserRbacContext` without a `roleId` returns the **highest** level across *all* the user's roles (per FINAL DECISIONS, multi-role users take their max). For visibility that is wrong: a user holding *Counsellor (L1)* **and** *PGP ADMIN (L5)*, signed in as the counsellor, would be scoped as L5 and see everything below level 5.
+
+Always pass the **acting** role — `req.user.selectedRoleId` — into anything that resolves visibility. Real case: `robert.johnson@mastersunion.org` holds Counsellor (L1) + GM (L4); acting as counsellor he correctly sees 122 leads, not 644.
+
+### Enforcement points
+
+| File | Function(s) | Notes |
+|---|---|---|
+| `v2/services/manageLeadService.js` | `buildLeadScopeWhere`, `fetchApplicationManager`, `fetchArchiveLeads`, `fetchV2LeadsForExport` | lead list, applicants, archive, export. `bulkLeadResolver` + bulk workers inherit via `buildLeadScopeWhere` |
+| `v2/services/adminDashboardV2Service.js` | `resolveVisibleCounsellorIds` → `applyCounsellorScope` / `buildScopeSql` | deliberately mirrors the lead list so a tile and the listing can never disagree |
+| `v2/services/calendar.service.js` | `getCalendarEventsForUserAndReporting` | |
+| `services/userDashboard.service.js` | 2 sites | |
+
+Dashboard cache keys include `roleKey` + `userKey`, so two roles can never share a cached scope. **Purge after any change here** (`GET /api/internal/cache/purge-lm?key=kms4000&prefix=lmapicache:dashboard:v2:`); `rbacService` also holds a 5-minute in-process cache that no endpoint can reach.
+
+### Known gaps — deliberately NOT scoped
+
+- **`v2/services/campaignRecipientResolver.js`** — email-campaign recipient resolution takes only `orgId` + `filterJson`; no `userId`/`roleId`. A Team Lead building a campaign can target every lead in the org. Its comment claims to mirror `buildLeadScopeWhere` but only mirrors the status/type filters, **not** counsellor visibility. Pre-existing, never scoped.
+- **Dashboard Queries + Communication tiles** — remain org-wide; `queries` has no `v2_lead_id`/`counsellor_id` and communication logs have neither, so there is no join path yet.
+- **People-pickers** (`getAllCounsellorsByUserOrganization`, `fetchCounsellorsByUser`) — intentionally unscoped; they populate assignment dropdowns, not record lists.
+
+### Level is breadth, actions are power
+
+A frequent modelling mistake: giving a read-only role level 1 to "limit" it. Level controls **how much data** is visible; **actions** control what can be done. Org 12 had `Admin View Only` and `Executive View` at level 1 — nothing below level 1, no leads assigned, so after this change they correctly see nothing. If such a role should see everything read-only, give it a **high level** and **view-only actions**.
+
+### Verified live (org 12, 2026-08-06)
+
+Dashboard total vs manage-leads total, per acting role — all exact matches against SQL:
+
+| User | Acting role | Visible leads |
+|---|---|---|
+| Naman | ADMIN 2 (L5) | 201,216 — was 425,995 before the fix |
+| Shreya | PGP TBM Counsellors (L3) | 83,645 |
+| Anushka | Counsellor sales (L1) | 10 |
+| Robert | Counsellor (L1), also holds GM (L4) | 122 — was 644 |
+
+Per-role peer check (one real user per role): every level sees itself, **0 peers**, **0 above**, and everyone below.
