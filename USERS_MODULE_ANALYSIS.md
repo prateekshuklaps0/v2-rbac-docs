@@ -21,6 +21,7 @@
 13. [Progress Log](#13-progress-log)
 14. [Stage & Sub-Stage Permissions (Per-Role Instance Scope)](#14-stage--sub-stage-permissions-per-role-instance-scope--2026-06-17)
 15. [Data Visibility — Whose Records You See](#15-data-visibility--whose-records-you-see--2026-08-06)
+16. [Auth Storage & RBAC Request Performance](#16-auth-storage--rbac-request-performance--2026-08-12)
 
 ---
 
@@ -1008,6 +1009,8 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-04-17 | v2 RBAC continuation alignment | ✅ Complete | Synced backend behavior with the working handoff: user form payload shape, helper endpoint response shape, and full org-module ancestry enforcement |
 | 2026-06-17 | Per-role stage/sub-stage permissions | ✅ Complete | New instance-level scope layer on top of action-key RBAC. See §14. Backend enforcement on change-stage (bulk + profile PATCH) and settings save; role-editor "Stage Access" tab. Migrations pending `npm run migrate`. |
 | 2026-08-06 | Data visibility keyed to role level | ✅ Complete | Third scope layer — WHOSE records you see. `users.role` ENUM removed as the org-wide test (it made every level-2 Team Lead an org-wide admin); replaced by `userService.isOrgWideActor` (level 6 = org owner). Lead list, applicants, archive, export, dashboard-v2, calendar, user-dashboard all aligned. See §15. |
+| 2026-08-12 | Auth storage consolidated to redux | ✅ Complete | `cookieService` deleted; the `auth` slice is the only client-side store. Fixed logout leaving the backend httpOnly cookie alive (up to 30 days) and 15 services authenticating on that cookie instead of the `Bearer` header. See §16. |
+| 2026-08-12 | RBAC endpoint performance | ✅ Complete | Sequelize multi-include cartesian (159,840 rows for ~81 rows of data): `/rbac/me/context` 8.5s → 0.35s, `/rbac/users/:id` 6.4s → 0.40s. Dashboard no longer blocks on `me/context`. See §16. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -2867,3 +2870,107 @@ Dashboard total vs manage-leads total, per acting role — all exact matches aga
 | Robert | Counsellor (L1), also holds GM (L4) | 122 — was 644 |
 
 Per-role peer check (one real user per role): every level sees itself, **0 peers**, **0 above**, and everyone below.
+
+---
+
+## 16. Auth Storage & RBAC Request Performance — 2026-08-12
+
+Frontend (`fe-anandi`) plus two backend query fixes. Nothing here changes *who*
+can see what — §15 remains the authority on that.
+
+### 16.1 One place for auth data
+
+The token used to live in **four** places: the redux `auth` slice, and three
+cookies — `crm_token`, `crm_user` (both JS-readable) and the backend's httpOnly
+`token`. Every RTK service read the cookie *in preference to* redux
+(`const cookieToken = getToken(); ... cookieToken || token`), so three copies of
+the same credential drifted independently.
+
+Now: **the `auth` slice in redux-persist is the only client-side store.**
+
+| Need auth in… | Use |
+|---|---|
+| a React component | `useSelector(AuthSelector)` |
+| an RTK `prepareHeaders` | `getState().persistedReducer[AuthSliceName]` |
+| a plain module (no React, no `getState`) | `Redux/authAccess.js` |
+
+`services/cookieService.js` is **deleted**. `Redux/authAccess.js` replaces it —
+it stores nothing, it only reads live redux state, and `store.js` registers the
+store with it so it can never form an import cycle.
+
+> `getAuthOrgId()` returns `orgInternalId || organizationId` — i.e.
+> `"masters-union"`, **not** `"12"`. That is what the old `crm_org_id` cookie
+> held, and ~20 files interpolate it straight into request URLs. Returning the
+> numeric id instead breaks them silently.
+
+### 16.2 Two real bugs this fixed
+
+**Logout did not log you out.** The frontend never called `/auth/logout`, and JS
+cannot delete an httpOnly cookie — so the backend's `token` cookie survived
+"logout" for its full `maxAge` (**1 day, or 30 days with Remember Me**) and kept
+authenticating requests, because `jwtValidator` accepts it as a fallback.
+
+**15 services authenticated on that cookie, not the header.** `jwtValidator` only
+reads the header when it starts with `Bearer `, but 15 service files sent the raw
+JWT with no prefix — including `rbacService` and `authService`. Their requests
+were silently falling through to the cookie. All 15 now send `Bearer`.
+
+There is now exactly one teardown, `authAccess.clearAuthEverywhere()`, used by
+the logout button, the 401 interceptor and `globalFunctions`. It does all three
+things that must happen together:
+
+1. dispatch `LogOut` (empties the slice)
+2. clear `localStorage` / `sessionStorage` (its persisted copy)
+3. `POST /auth/logout` so the server drops the httpOnly cookie
+
+`SetLoginData` also resets to a clean state before applying the payload — it
+previously assigned only 28 of 35 fields, so `IP`, `paymentsData`, `roles` and
+`organization` leaked across sessions.
+
+### 16.3 The Sequelize cartesian trap (read this before adding an include)
+
+`getUser` eager-loaded **five** `belongsToMany` associations in one `findByPk`.
+Sequelize emits a single join, so Postgres materialises their cartesian product
+before de-duplicating in JS. For an admin with 2 roles x 6 schools x 37 programs
+x 36 forms that is **159,840 rows** to return ~81 rows of data.
+
+| Endpoint | Before | After |
+|---|---|---|
+| `/rbac/me/context` | **8.5s** | **0.33–0.36s** |
+| `/rbac/users/:id` | **6.4s** | **0.40s** |
+
+Both now resolve the lists as two waves of parallel queries — junction ids
+first, then the entities — so no list multiplies against another.
+
+- `userService.getUserAllocations` is the lean path for `/me/context`, which
+  only ever needed schools/programs/forms.
+- `getUser` keeps its full contract (roles, reportingManagers, status …) and was
+  verified byte-identical against captured baselines for four users.
+
+> Both use an explicit `order: [['id','ASC']]`. The old join *happened* to come
+> back id-ascending; `WHERE id IN (...)` guarantees nothing. `Header.jsx`
+> auto-selects `schools[0]`, so a non-deterministic order could silently change
+> which school a user lands on.
+
+**Rule of thumb:** more than one `belongsToMany` include in a single query is a
+cartesian product. Split them.
+
+### 16.4 The `me/context` waterfall
+
+Every query on the Admin Dashboard was gated on `isUserContextReady`, which came
+from `/rbac/me/context` — so a cold load blocked ~8.5s before any dashboard
+request was even issued. The `currentUserContext` slice is now persisted
+(its own redux-persist key, so `store.currentUserContextState` and its 16
+consumers are untouched), and the gate opens from the rehydrated copy while the
+network refreshes behind it.
+
+The slice resets on `LogOut` and `SetLoginData`, and stamps `orgId`/`userId` so a
+persisted copy can never be shown to a different user.
+
+### 16.5 Verified
+
+Playwright, real logins against the live v2 DB: 38 routes with real API traffic
+(no 401/403/5xx/JS errors), 20 Bearer / 0 raw headers, logout destroying the
+httpOnly cookie with no JWT left in `localStorage`, cross-user isolation across a
+logout→login, expired-session self-clear, and a full user **create → edit →
+delete** round trip confirmed in both the DB and the UI.
