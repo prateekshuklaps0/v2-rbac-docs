@@ -1011,6 +1011,7 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-08-06 | Data visibility keyed to role level | ✅ Complete | Third scope layer — WHOSE records you see. `users.role` ENUM removed as the org-wide test (it made every level-2 Team Lead an org-wide admin); replaced by `userService.isOrgWideActor` (level 6 = org owner). Lead list, applicants, archive, export, dashboard-v2, calendar, user-dashboard all aligned. See §15. |
 | 2026-08-12 | Auth storage consolidated to redux | ✅ Complete | `cookieService` deleted; the `auth` slice is the only client-side store. Fixed logout leaving the backend httpOnly cookie alive (up to 30 days) and 15 services authenticating on that cookie instead of the `Bearer` header. See §16. |
 | 2026-08-12 | RBAC endpoint performance | ✅ Complete | Sequelize multi-include cartesian (159,840 rows for ~81 rows of data): `/rbac/me/context` 8.5s → 0.35s, `/rbac/users/:id` 6.4s → 0.40s. Dashboard no longer blocks on `me/context`. See §16. |
+| 2026-08-13 | Form-scoped visibility (`roles.visibility_scope`) | ✅ Complete | Third scope axis: a role can see every lead on its members' allocated application forms, OR'd with the reporting downline. Reporting managers inherit a form-scoped report's view. All lead surfaces + dashboard tiles resolve through one function (`resolveActorVisibility`). Role editor toggle added; profile page now shows the user's reporting line. See §15. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -2831,6 +2832,61 @@ Both level tests are **strictly below**, so **peers are never visible**: a Team 
 
 `includeRoleHierarchy` / `capReportingByLevel` both **require `orgId` and `roleId`** and throw `400` without them — levels are per-org, and see the multi-role note below.
 
+> **UPDATE 2026-08-07 — `includeRoleHierarchy` is OFF at all 11 call sites** (commit
+> `780c3d99` "rbac toggle"). Visibility in the running system is therefore **purely
+> reporting-based**: self + capped reporting downline. Item 3 above is dormant.
+> Consequence worth knowing: a level-5 user with one report who owns no leads sees
+> **zero** records — correct per the toggle, but a common source of "why can't I see
+> anything?".
+
+### The form-scope axis — `roles.visibility_scope` (2026-08-13)
+
+The reporting tree is no longer the only way to be granted records. A role now
+carries `visibility_scope`:
+
+| Value | Meaning |
+|---|---|
+| `hierarchy` *(default)* | self + capped reporting downline — everything above |
+| `forms` | the above **UNION** every lead on the user's allocated application forms |
+
+Resolved by **`userService.resolveActorVisibility`**, which returns
+`{ unscoped, userIds, formIds }`. The two arms are **OR'd, never AND'ed**:
+
+```sql
+WHERE counsellor_id = ANY(userIds) OR form_id = ANY(formIds)
+```
+
+so a `forms` user sees every lead on their forms **regardless of owner**,
+including unassigned ones. An intersection would make the role useless — its
+members typically own no leads at all.
+
+`formIds` is filled from two places:
+
+1. **The actor's own** allocated forms, only when the role they *signed in with*
+   is `forms`-scoped (same acting-role rule as level).
+2. **Their reports' forms** — for any user in the capped downline holding a
+   `forms` role. Without this, making someone the reporting manager of a
+   form-scoped user grants nothing, because such users own no rows. This cascade
+   follows the **reporting tree only**; it is not `includeRoleHierarchy`.
+
+Two deliberate decisions:
+
+- **School allocation does not gate forms.** A form allocated to a user whose
+  school is not allocated still grants visibility ("form is the authority"), so
+  nothing an admin ticks is silently ignored. School only drives dropdown options.
+- **A client-supplied `formId` can only narrow.** It is AND'ed onto the clause
+  above, so passing an unallocated form still returns only rows the OR already
+  permits. Form ids are always derived server-side.
+
+> **Blast radius warning:** the scope of a `forms` role is set by *which forms you
+> tick per user*, not by the role. Allocating a large form (PGP TBM ≈ 150k leads)
+> grants that whole population. Ticking every form makes the role equivalent to a
+> level-6 admin.
+
+**Every** lead surface resolves through `resolveActorVisibility` — lead list,
+applicants, archive, export, and all dashboard tiles — precisely so a dashboard
+count can never disagree with the page it links to.
+
 ### `roleId` is mandatory — the multi-role trap
 
 `getUserRbacContext` without a `roleId` returns the **highest** level across *all* the user's roles (per FINAL DECISIONS, multi-role users take their max). For visibility that is wrong: a user holding *Counsellor (L1)* **and** *PGP ADMIN (L5)*, signed in as the counsellor, would be scoped as L5 and see everything below level 5.
@@ -2847,6 +2903,28 @@ Always pass the **acting** role — `req.user.selectedRoleId` — into anything 
 | `services/userDashboard.service.js` | 2 sites | |
 
 Dashboard cache keys include `roleKey` + `userKey`, so two roles can never share a cached scope. **Purge after any change here** (`GET /api/internal/cache/purge-lm?key=kms4000&prefix=lmapicache:dashboard:v2:`); `rbacService` also holds a 5-minute in-process cache that no endpoint can reach.
+
+**Changing a role's `visibility_scope` needs BOTH caches purged** — the RBAC
+context (`prefix=cache:v2:rbac-context:`) and the dashboard — or the old scope
+survives for up to 5 minutes.
+
+#### The two dashboard totals must mirror the two list pages
+
+Fixed 2026-08-13. `Total Leads` and `Total Applications` are clickthroughs into
+`/admin/v2/manage-leads` and `/admin/v2/manage-applicants`, so both now build on
+`buildLeadsListingWhere` — the same predicate those pages use (Applications adds
+`type: 'applicant'`).
+
+They previously diverged: the applicant tiles used `buildScopedLeadWhere`, which
+additionally auto-filters to the user's allocated forms via `resolveScope`, while
+the listing pages do not. A form-restricted user therefore saw one number on the
+tile and a different one on the page behind it.
+
+The **paid / unpaid** tiles still use `buildScopedLeadWhere` on purpose — they are
+payment analytics with no clickthrough, so nothing has to reconcile against them.
+
+> When adding a dashboard tile: if it links to a list, build its `where` the same
+> way that list does. Otherwise it will drift, and users report it as a bug.
 
 ### Known gaps — deliberately NOT scoped
 
