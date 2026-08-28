@@ -22,6 +22,7 @@
 14. [Stage & Sub-Stage Permissions (Per-Role Instance Scope)](#14-stage--sub-stage-permissions-per-role-instance-scope--2026-06-17)
 15. [Data Visibility — Whose Records You See](#15-data-visibility--whose-records-you-see--2026-08-06)
 16. [Auth Storage & RBAC Request Performance](#16-auth-storage--rbac-request-performance--2026-08-12)
+17. [`users.role` — Why It Is Neither an Authority Nor an Index](#17-usersrole--why-it-is-neither-an-authority-nor-an-index--2026-08-28)
 
 ---
 
@@ -3052,3 +3053,141 @@ Playwright, real logins against the live v2 DB: 38 routes with real API traffic
 httpOnly cookie with no JWT left in `localStorage`, cross-user isolation across a
 logout→login, expired-session self-clear, and a full user **create → edit →
 delete** round trip confirmed in both the DB and the UI.
+
+---
+
+## 17. `users.role` — Why It Is Neither an Authority Nor an Index — 2026-08-28
+
+`users.role` has now caused two production problems for two completely unrelated
+reasons, and the answer to both is "don't touch it". §15 covers why it is not a
+permission authority. This section covers why it must not be *queried* — and, the
+non-obvious half, why the fix is **not** to index it.
+
+### 17.1 The incident
+
+CRM-wide slowness, user complaints arriving in waves every ~15 minutes. RDS
+Performance Insights:
+
+| # | Load (AAS) | % | Query |
+|---|---|---|---|
+| 1 | 3.104 | **90.8%** | `SELECT id, email, password_hash, role, … FROM users` |
+| 2 | 0.121 | 3.5% | `INSERT INTO timelines …` |
+| 3 | 0.052 | 1.5% | `UPDATE communicationAudiences SET code…` |
+| 4 | 0.029 | 0.9% | `SELECT … communicationAudiences JOIN communicationLogs` |
+| 5 | 0.024 | 0.7% | `UPDATE communicationAudiences SET status…` |
+
+Total 3.42 AAS on a 4-vCPU instance — roughly 85% of the box's parallelism, almost
+all of it one query.
+
+The query is `getSystemUser()` in `src/utils/queueUtils.js`:
+
+```js
+db.User.findOne({ where: { role: "super_admin" } })
+```
+
+`EXPLAIN ANALYZE`:
+
+```
+Limit  (actual time=0.599..56.036 rows=1)
+  ->  Gather   Workers Planned: 2   Workers Launched: 2
+        ->  Parallel Seq Scan on users
+              Filter: (role = 'super_admin')
+              Rows Removed by Filter: 140622
+              Buffers: shared hit=84102
+```
+
+84,102 buffers ≈ **657 MB read, 56 ms, and 3 CPUs** (parent plus 2 parallel workers)
+**per call**. `users` is 931 MB across 423,493 live rows, and had accumulated 4.3M
+sequential scans reading 555 billion rows cumulatively.
+
+### 17.2 It was not the frontend
+
+No page caused this. The origin is an inbound vendor webhook:
+
+```
+Karix (WhatsApp vendor)
+  → POST /webhooks/karix   (+ /karix-ug, /karix-pgprise, /karix-pgptbm)
+  → handleKarixWebhook.controller → karixWhatsappQueue.add("deliveryEventWebhook")
+  → karixWhatsapp.worker          → getSystemUser() → 657 MB scan
+```
+
+Every delivery event (sent / delivered / read / failed) becomes one queue job, and
+each job calls `getSystemUser()` one to three times — `karixWhatsapp.worker:249`,
+`:670`, and `deliveryStatus.helper:149` reached via `:134`. At ~460,000 messages/day
+that is millions of scans.
+
+Note the whole top-5 is a *single pipeline*: #2 is the timeline write, #3/#4/#5 the
+delivery status write-back. **97.4% of database load was the WhatsApp delivery
+flow.** The only frontend endpoint that touches `getSystemUser()` is
+`PATCH /waba/chat/:chatUUID/status`, once per agent click — irrelevant by volume.
+
+> **Lesson.** When the CRM is slow "everywhere at once" and no single page is at
+> fault, look at queue workers and vendor webhooks before looking at the UI. Shared
+> RDS saturation makes every page slow regardless of what the user clicked.
+
+### 17.3 The fix: cache, don't index
+
+`getSystemUser()` now resolves once per process, with an in-flight promise guard to
+collapse the cold-start stampede (without it, every job starting before the first
+lookup resolves fires its own scan). Measured: 8 concurrent calls → **1 query**;
+2,000 sequential calls → **1 query total, 1 ms**.
+
+The query text itself was left byte-identical, deliberately — see below.
+
+### 17.4 Why NOT an index on `users.role` — the part that matters
+
+Adding `CREATE INDEX ON users (role)` is the obvious fix and it is **wrong**. There
+are **4** rows with `role = 'super_admin'`, and the query has **no `ORDER BY`**:
+
+```sql
+SELECT … FROM users WHERE role = 'super_admin' LIMIT 1;
+```
+
+`LIMIT 1` without `ORDER BY` returns an *arbitrary* row — whichever the chosen plan
+reaches first. Under a sequential scan that is physical heap order, which today
+yields id 5913. An index scan walks the index instead and can return a different one
+of the four.
+
+That id is written as the actor on system-authored records — `timelines.created_by`,
+WhatsApp chat messages, stage logs. So the index would silently re-attribute every
+future system-authored record to a different user, with no error raised and no
+migration to point at. **The table would get faster and the data would get wrong.**
+
+> **Rule.** Never add an index to change the plan of a `LIMIT`-without-`ORDER BY`
+> query. Fix the query first — a deterministic `ORDER BY`, or a lookup by unique key
+> — or remove the need for it, as here, by caching. Only then consider the index.
+
+Related trap: `src/utils/getSystemUser.js` is a second, already-cached implementation
+that resolves a **different** user (id 4441913, looked up by email, which uses
+`users_email`). The two are not interchangeable — repointing callers from one to the
+other also changes attribution.
+
+### 17.5 Standing rules for `users.role`
+
+1. **Not a permission authority.** It only records which portal a user belongs to —
+   admin, super admin, or student. Use the acting role's level and action keys
+   (§15), never this column.
+2. **Do not filter by it.** Unindexed on a 931 MB table; every such query is a
+   parallel sequential scan occupying 3 CPUs.
+3. `roleValidator('super_admin', 'admin', 'manager')` in `lead.routes.js`
+   (`bulk-archive`, `bulk-unarchive`, `bulk-delete`) still gates on this column.
+   Legacy — do not copy it into new routes; use `rbacMiddleware.requireAction`.
+4. **A system actor must come from a cached helper.** Never look one up per message,
+   per job, or per webhook.
+
+### 17.6 Verified
+
+`EXPLAIN ANALYZE` captured before the change. After: 2,008 calls produced 1 query,
+and `getSystemUser()` returned id 5913 — identical to the pre-change row, so
+attribution is unchanged. Diff is **+34 / −0** lines in one file; eslint output
+identical before and after (3 pre-existing errors, 1 warning, none in the edited
+region). No schema change and no migration — the fix takes effect on restart, and
+the cached value is held per process until it restarts.
+
+### 17.7 Open, not fixed
+
+The row this resolves to is **id 5913, `superadminstaging@test.com`, status
+`disabled`** — a staging test account currently recorded as the actor on production
+WhatsApp and SMS timeline entries. Pre-existing, and deliberately left alone: it is
+an attribution decision, not a performance fix. Worth deciding whether these should
+point at the real automation user (id 4441913).
