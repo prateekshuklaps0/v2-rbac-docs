@@ -1,5 +1,5 @@
 # Users / Roles / Permissions Module — Deep Analysis
-> Maintained by AI Agent | Last Updated: 2026-04-20 (Implementation In Progress)
+> Maintained by AI Agent | Last Updated: 2026-09-13 (Implementation In Progress)
 > Branch: `users` | All new work → `v2` folder (backend) and `pages/Admin/v2/` (frontend)
 
 ---
@@ -23,6 +23,7 @@
 15. [Data Visibility — Whose Records You See](#15-data-visibility--whose-records-you-see--2026-08-06)
 16. [Auth Storage & RBAC Request Performance](#16-auth-storage--rbac-request-performance--2026-08-12)
 17. [`users.role` — Why It Is Neither an Authority Nor an Index](#17-usersrole--why-it-is-neither-an-authority-nor-an-index--2026-08-28)
+18. [One Email, Several `users` Rows — Identity, Duplicates & Super-Admin Accounts](#18-one-email-several-users-rows--identity-duplicates--super-admin-accounts--2026-09-13)
 
 ---
 
@@ -585,6 +586,9 @@ If `env.MASTER_PASSWORD` is set, this password bypasses bcrypt for ANY user's lo
 **CS5 — Generated password returned in API response**
 `createUser` returns `generatedPassword` in the response body. If any log/monitoring tool captures API responses, passwords are exposed.
 
+**CS6 — `POST /api/users/` creates a `super_admin` with no authentication** *(found 2026-09-13, open)*
+`routes/users.routes.js:47` mounts `createUser` with no `jwtValidator` and no rate limit, and the controller accepts `role: "super_admin"` from the body. Confirmed live on `api-v2` (201, id 4895048). No client calls this route. Remove it. See §18.4.
+
 ### 🔴 Critical Data/Logic Bugs
 
 **DB1 — getAllRoles has zero org scoping**
@@ -1013,6 +1017,12 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-08-12 | Auth storage consolidated to redux | ✅ Complete | `cookieService` deleted; the `auth` slice is the only client-side store. Fixed logout leaving the backend httpOnly cookie alive (up to 30 days) and 15 services authenticating on that cookie instead of the `Bearer` header. See §16. |
 | 2026-08-12 | RBAC endpoint performance | ✅ Complete | Sequelize multi-include cartesian (159,840 rows for ~81 rows of data): `/rbac/me/context` 8.5s → 0.35s, `/rbac/users/:id` 6.4s → 0.40s. Dashboard no longer blocks on `me/context`. See §16. |
 | 2026-08-13 | Form-scoped visibility (`roles.visibility_scope`) | ✅ Complete | Third scope axis: a role can see every lead on its members' allocated application forms, OR'd with the reporting downline. Reporting managers inherit a form-scoped report's view. All lead surfaces + dashboard tiles resolve through one function (`resolveActorVisibility`). Role editor toggle added; profile page now shows the user's reporting line. See §15. |
+| 2026-08-28 | `getSystemUser()` cached — 91% DB load | ✅ Complete | Uncached `users WHERE role = 'super_admin'` seq scan (657 MB, 3 CPUs) ran per WhatsApp/SMS delivery event. Cached per process; deliberately **not** indexed (would change the `LIMIT 1` row and re-attribute system records). See §17. |
+| 2026-09-13 | Staff duplicate-email rule; super-admin create fixed | ✅ Complete | `users.email` is not unique; student rows are a separate identity. `createSuperAdmin` now ignores student rows and compares case-insensitively. `updateMe` still has the old check (open). See §18.1–18.2. |
+| 2026-09-13 | Super-admin accounts card | ✅ Complete | Fixed list emptied by the search debounce after data arrived; create-drawer errors now inline only (`INLINE_ERROR_ENDPOINTS`). See §18.5. |
+| 2026-09-13 | Test-email 403 mislabelled as a permission error | ✅ Complete | Not RBAC: sender verification. Preview drawers now resolve the org sender (`utils/orgSender.js`). See §18.6. |
+| 2026-09-13 | Unauthenticated `POST /api/users/` creates `super_admin` | 🔴 Open | Unused route, live on api-v2. Recommend removal. See CS6 / §18.4. |
+| 2026-09-13 | Mixed-case staff twin rows break login (kapish) | 🔴 Open | Reset and login resolve different rows. UPDATE proposed, not run. See §18.3. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -3191,3 +3201,192 @@ The row this resolves to is **id 5913, `superadminstaging@test.com`, status
 WhatsApp and SMS timeline entries. Pre-existing, and deliberately left alone: it is
 an attribution decision, not a performance fix. Worth deciding whether these should
 point at the real automation user (id 4441913).
+
+---
+
+## 18. One Email, Several `users` Rows — Identity, Duplicates & Super-Admin Accounts — 2026-09-13
+
+`users.email` has **no unique constraint**. There are only three plain indexes on it
+(`users_email`, `users_email_status`, `users_email_lower_idx`). The same address
+legitimately sits on many rows — `rohit.yadav@mastersunion.org` has 4 student rows.
+Read this before writing any "does this email already exist?" check.
+
+### 18.1 The identity rule
+
+- **Student rows are a separate identity.** One person can be a student (often on
+  several rows) and also be staff. A student row never blocks a staff account.
+- **Staff rows (`admin`, `super_admin`) must be unique per email, ignoring case, in
+  every status.** Every staff auth lookup silently assumes this:
+
+| Lookup | Where | Filter |
+|---|---|---|
+| `adminLoginV2` | `controllers/users/authController.js:344` | `LOWER(email) = x AND role <> 'student'` |
+| `superAdminLogin` | `controllers/users/authController.js:159` | `LOWER(email) = x AND role = 'super_admin'` (no status filter) |
+| `forgotPassword` | `controllers/users/authController.js:744` | exact `email = x`, then `ILIKE`; `role <> 'student'` |
+| v2 `createUser` | `v2/services/userService.js:789` | `email = x AND role <> 'student'` |
+
+None of them has an `ORDER BY`. If two staff rows share an email, which one you get
+is arbitrary — the same trap as §17.4.
+
+> **Rule.** A duplicate-email check for a staff account must (1) ignore student rows,
+> (2) compare with `LOWER(email)`, and (3) include every status, `disabled` too —
+> `superAdminLogin` does not filter status, so a disabled twin can shadow the live one.
+
+### 18.2 Fixed — "A user with this email already exists" for a brand-new super admin
+
+**Symptom.** Super-admin portal → `/profile` → *Create super admin* with
+`rohit.yadav@mastersunion.org` → `409 A user with this email already exists`, while
+`SELECT … WHERE role = 'super_admin'` returned 0 rows.
+
+**Cause.** `createSuperAdmin` (`controllers/super_admin/userController.js:175`,
+route `POST /api/super_admin/users/accounts`) checked `where: { email }` — any role,
+any status. It matched Rohit's 4 student rows.
+
+**Fix** (`userController.js:204`). The check is now `LOWER(email) = x AND role <> 'student'`,
+and the message says what it clashed with:
+
+| Existing staff row | Message |
+|---|---|
+| `super_admin`, active | A super admin with this email already exists |
+| `super_admin`, disabled | A deleted super admin account with this email already exists |
+| `admin` | An admin account with this email already exists |
+
+**Verified** (read-only, v2 DB): `rohit.yadav@…` → no conflict (the old rule matched 4 rows);
+existing super admin id 4899981 → still blocked; existing admin id 6001 → still blocked.
+
+**Same bug, not fixed:** `updateMe` (`userController.js:107`) still checks
+`email = x AND id <> me` — any role, exact case. A super admin changing their own email
+to an address that has student rows is wrongly rejected.
+
+### 18.3 Open — mixed-case staff twins break login (the kapish case)
+
+`kapish.sabharwal@mastersunion.org` has two staff rows whose emails differ only by case.
+
+1. `forgotPassword` tries an exact match first → it resets the **lowercase** row.
+2. `adminLoginV2` uses `LOWER(email)` with no `ORDER BY` → it can pick the **capital-K** row.
+3. Result: "Incorrect Password" straight after a successful reset.
+
+Two more users have the same shape. Proposed, **not run** (awaiting approval):
+
+```sql
+-- park the orphan rows so each staff email resolves to exactly one row
+UPDATE users SET email = 'dup-' || id || '.' || email, updated_at = NOW()
+ WHERE id IN (4627803, 4749008, 4644995);
+```
+
+Code follow-up: one shared `findAuthUserByEmail()` (exact match first, then
+case-insensitive) used by both login and password reset, so they can never disagree.
+
+### 18.4 Security — `POST /api/users/` creates a super admin with no login
+
+See **CS6** in §6. Summary:
+
+- `routes/users.routes.js:47` — `router.post('/', createUser)`: no `jwtValidator`,
+  no rate limit.
+- `controllers/users/userController.js` `createUser` takes `role` from the body and
+  accepts `super_admin`.
+- **Confirmed live** on `api-v2.mastersunion.org` (`201`, user id 4895048,
+  `role: super_admin`). That account can sign in to the super-admin portal through
+  `superAdminLogin`.
+- **Nothing calls it.** No caller in `fe-anandi`, `super-admin`, `widget-v2`, or the
+  backend. All real user creation goes through `admin/users`,
+  `org/:orgId/rbac/createUser`, `v2/org/:orgId/rbac/users` or its bulk upload.
+- **Recommended:** delete the route line. **Status: open, not changed.**
+
+To review super admins created outside the portal (they have no `super_admin.create`
+audit row). Older bootstrap accounts will also appear, so treat it as a list to check,
+not proof:
+
+```sql
+SELECT u.id, u.email, u.status, u.created_at
+  FROM users u
+ WHERE u.role = 'super_admin'
+   AND NOT EXISTS (SELECT 1 FROM audit_logs a
+                    WHERE a.action = 'super_admin.create'
+                      AND a.target_id = u.id::text)
+ ORDER BY u.created_at DESC;
+```
+
+### 18.5 Super-admin portal — *Super admin accounts* card and *Create* drawer
+
+File: `super-admin/src/features/superAdminProfile/ui/SuperAdminProfilePage.jsx`.
+
+**a) Empty list while the API returned rows — fixed.**
+The card showed "No super admin accounts match this search." *and* "Load more", while
+`GET /accounts?page=1&limit=4` returned users. The page copies API rows into local
+`accounts` state (so "Load more" can append). The 350 ms search debounce ran on mount
+and **always** emptied that list:
+
+| Time | Event | `accounts` |
+|---|---|---|
+| 0 ms | page mounts, request starts, 350 ms timer starts | `[]` |
+| ~250 ms | response arrives, sync effect copies rows | 4 rows |
+| 350 ms | timer fires, empties the list; search is still empty | `[]` |
+| after | query arg unchanged → no new data → sync effect never re-runs | stays `[]` |
+
+It hit whenever the API answered in under 350 ms, and every time on in-app navigation
+back (cached data). Fix (line 44): the debounce resets page/list **only when the
+trimmed search actually changed**.
+
+> **Rule.** Never clear state that is filled from an RTK Query result unless the query
+> argument changes in the same update. If the argument stays the same, no new data
+> arrives to refill it.
+
+**b) Create errors are shown inline only — changed.**
+The backend error used to appear three times: two toasts (the page's own `pushToast`
+plus the global `rtkErrorMiddleware`) and the red `DrawerError`.
+
+- `infrastructure/api/rtkErrorMiddleware.js:17` — new `INLINE_ERROR_ENDPOINTS` set
+  (`createSuperAdmin`). Endpoints in it get no global toast. A 401 still shows
+  "Session expired" and logs out.
+- The drawer's `catch` no longer calls `pushToast`. The message stays in `DrawerError`.
+- `updateCreateForm` (line 30) wraps every drawer field change and clears that error.
+
+To make another screen inline-only: add its RTK `endpointName` to the set and do not
+`pushToast` in its `catch`.
+
+### 18.6 Said "no permission", was not RBAC — test-email 403
+
+"No permission to send test emails" for `admin-gurgaon@anandi.org`, with no such
+permission configured anywhere.
+
+- `/sendTestEmail` has **no `requireAction`**. The 403 comes from **sender
+  verification** (`controllers/templateManager/communicationEmail.ctrl.js:124`): the
+  `fromEmail` was not one of the org's configured senders.
+- The frontend labelled every 403 as a permission error.
+- **Fixed in `fe-anandi`:** new `src/utils/orgSender.js` (`resolveOrgSender`) picks
+  the org's transactional sender. `EmailPreviewFilter.jsx` (used the logged-in user's
+  email) and `SideFilter/PreviewFilter/PreviewFilter.jsx` (hardcoded
+  `admissions@anandi.org`) now use it. The false "permission" label is removed there
+  and in `EmailBuilder.jsx` / `EmailBuilderV2.jsx`; the backend message is shown instead.
+- **Open:** the backend should arguably return 400/422 for this, not 403.
+
+> **Lesson.** Before debugging RBAC for a "no permission" message, check that the route
+> actually has a `requireAction`.
+
+### 18.7 Diagnoses with no code change
+
+- **Login role picker ≠ `user_roles` rows.** The picker lists only `user_roles` rows
+  with `is_active = true`. For `kishan.soni@mastersunion.org` the Admin row had
+  `is_active = false`, so it was not offered. `audit_logs` shows who deactivated it
+  and when. Note there are three different "removed" flags:
+  `user_roles.is_active` (role assignment), `org_users.status = 'removed'`
+  (membership), `v2_leads.is_deleted` (data).
+- **Allocated forms, but no leads visible.** `rahul1+ug2@…` and `chandana.jaiswal+1@…`
+  hold `visibility_scope = 'hierarchy'` roles, own 0 leads and have 0 reports.
+  Their form allocations (45,899 leads) are ignored by a hierarchy role — working as
+  designed (§15). Pending decision: set role 58 "UG ADMIN" (2 holders) to `'forms'`;
+  do **not** flip role 46 (564 holders, ~24 forms each — it would widen hundreds of
+  users). Move Chandana to an existing forms role (40 "Admin View Only" / 56
+  "Executive View") instead.
+
+### 18.8 Open, not fixed
+
+| # | Item | See |
+|---|---|---|
+| 1 | Remove unauthenticated `POST /api/users/`; review super admins it may have created | CS6, §18.4 |
+| 2 | Park the 3 mixed-case staff twin rows; add shared `findAuthUserByEmail()` | §18.3 |
+| 3 | `updateMe` duplicate-email check: same bug as §18.2 | §18.2 |
+| 4 | Test-email sender failure should not be HTTP 403 | §18.6 |
+| 5 | Role 58 / Chandana visibility-scope decision | §18.7 |
+| 6 | No DB unique index for staff emails — a partial `UNIQUE (LOWER(email)) WHERE role <> 'student'` would enforce §18.1, but only after #2 is cleaned up | §18.1 |
