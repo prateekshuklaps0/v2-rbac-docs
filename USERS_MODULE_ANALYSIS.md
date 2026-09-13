@@ -24,6 +24,7 @@
 16. [Auth Storage & RBAC Request Performance](#16-auth-storage--rbac-request-performance--2026-08-12)
 17. [`users.role` — Why It Is Neither an Authority Nor an Index](#17-usersrole--why-it-is-neither-an-authority-nor-an-index--2026-08-28)
 18. [One Email, Several `users` Rows — Identity, Duplicates & Super-Admin Accounts](#18-one-email-several-users-rows--identity-duplicates--super-admin-accounts--2026-09-13)
+19. [Super-Admin Portal — Forgot Password, Access Requests, Phone Uniqueness](#19-super-admin-portal--forgot-password-access-requests-phone-uniqueness--2026-09-13)
 
 ---
 
@@ -1023,6 +1024,9 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-09-13 | Test-email 403 mislabelled as a permission error | ✅ Complete | Not RBAC: sender verification. Preview drawers now resolve the org sender (`utils/orgSender.js`). See §18.6. |
 | 2026-09-13 | Unauthenticated `POST /api/users/` creates `super_admin` | 🔴 Open | Unused route, live on api-v2. Recommend removal. See CS6 / §18.4. |
 | 2026-08-27 | Mixed-case admin twin rows parked (kapish) | ✅ Complete | Rows 4627803, 4644995, 4749008 renamed to `dup-<id>.<email>`; 0 per-portal twins remain (checked 2026-09-13). Shared `findAuthUserByEmail()` still open. See §18.3. |
+| 2026-09-13 | Super admin phone number unique | ✅ Complete | `createSuperAdmin` rejects a phone + country ISO already held by a non-deleted super admin. See §19.1. |
+| 2026-09-13 | Super-admin portal forgot password | ✅ Complete | Public forgot → verify link → reset flow; 15-min single-use token bound to the password hash; link host never taken from request headers. See §19.2. |
+| 2026-09-13 | Super-admin portal Contact Administrator | ✅ Complete | Public access-request form emails the platform owner; honeypot, 5/hour per IP, all input escaped. See §19.3. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -3487,6 +3491,157 @@ No migration and no data change are needed. Rollback = revert the four files.
 | 6 | `jwtValidator.js:92` blocks only `disabled`, so a token issued to a now-`invited` user keeps working | §18.8 |
 | 7 | Legacy `org/:orgId/rbac/createUser` (`controllers/rbac/usersController.js`) still rejects an email that exists on **any** row, students included | §18.1 |
 | 8 | Phone OTP login (`POST /api/users/auth/send-otp`, `verify-otp`, `otpController.js`) looks up `users` by phone with **no role filter** and signs a JWT for whatever row it finds, `super_admin` included. No frontend calls it. Super admins rajat.puri (4899993) and rohit.yadav (4901416) share phone 9000007063 | §18.8.2 |
-| 9 | `createSuperAdmin` has no phone-uniqueness check (see #8) | §18.8.2 |
+| 9 | ~~`createSuperAdmin` has no phone-uniqueness check~~ — **fixed 2026-09-13**, see §19.1 | §19.1 |
 | 10 | Student email-OTP also sends a WhatsApp copy via `karixAuthOtp.service.sendKarixAuthOtp`, which looks up `email ILIKE x` with no role filter — for a twin it may use another row's phone | §18.8.2 |
 | 11 | Org audit actor page (`v2/controllers/auditLogController.js`, fallback when no `actorId`) resolves the display user by email with no role filter | §18.8.2 |
+
+---
+
+## 19. Super-Admin Portal — Forgot Password, Access Requests, Phone Uniqueness — 2026-09-13
+
+Three additions to the super-admin portal sign-in experience and account creation.
+Backend: `controllers/super_admin/superAdminAuthController.js` (new, public),
+`controllers/super_admin/userController.js`, `routes/users.routes.js`,
+`middleware/rateLimit.js`, `services/emailService.js`, two new templates in
+`templates/product/emails/`. Frontend (super-admin): `features/auth/ui/` —
+`ForgotPasswordPage`, `ResetPasswordPage`, `ContactAdministratorPage`, `AuthLayout`,
+`PhoneNumberField`, `AuthPages.styles`, `authFormUtils`; routes in `app/routes/AppRoutes.jsx`.
+
+### 19.1 One phone number per live super admin
+
+`createSuperAdmin` now rejects a new super admin whose phone is already held by another
+super admin:
+
+```sql
+role = 'super_admin' AND status <> 'disabled' AND phone = <digits> AND country_iso = <ISO>
+```
+
+→ **409 "A super admin account with this phone number already exists"**.
+
+- Checked **after** the email check, so a duplicate email is reported first.
+- **Deleted (`disabled`) accounts are ignored** — they cannot sign in, and counting them
+  would block re-creating an admin whose earlier account was deleted.
+- Same digits under a different country ISO is allowed.
+- Uses `users_phone_country_code_idx` (leading column `phone`).
+- **Existing data left as is:** rajat.puri (4899993) and rohit.yadav (4901416) are both
+  active and share `9000007063` / IN.
+- **Not covered:** `updateMe` does not check phone uniqueness when a super admin edits
+  their own profile.
+
+### 19.2 Forgot password
+
+Same journey as the admin portal: enter email → "check your inbox" → link opens the reset
+page → the link is verified on load → new password with a live rule checklist → success →
+sign in.
+
+| Endpoint (public, under `/api/users`) | Limiter | Purpose |
+|---|---|---|
+| `POST /auth/super-admin/forgot-password` `{ email }` | `superAdminRecoveryLimiter` (20 / 15 min / IP, shared) | email a reset link |
+| `POST /auth/super-admin/reset-password/verify` `{ token }` | same | check a link when the page loads |
+| `POST /auth/super-admin/reset-password` `{ token, password, confirmPassword }` | same | set the new password |
+
+**The token.** A JWT `{ type: 'super_admin_password_reset', userId, pwf }`, valid 15 minutes.
+`pwf` = HMAC-SHA256(`JWT_SECRET`, password hash), first 32 hex characters.
+
+- **Single use:** the moment the password changes — through this reset or any other path —
+  the fingerprint no longer matches, so every earlier link stops working. No tokens table.
+- The reset re-checks the token **under a row lock**, so two simultaneous submits of one
+  link cannot both succeed.
+- Rejected with one identical message ("invalid or has expired") for every failure: expired,
+  forged, wrong secret, wrong `type`, used, account disabled, or not a super admin.
+- Cannot be used on the admin portal's `/auth/reset-password` (different `type`), and the
+  admin portal's token cannot be used here.
+
+**Where the link points — never from the request.** CORS on this API accepts every origin,
+and anyone can call it with a forged `Origin` header. Building the link from that header
+would email a real super admin a working token that points at an attacker's site. The link
+host is resolved as:
+
+1. `SUPER_ADMIN_PORTAL_URL` env var, if set;
+2. else a `http://localhost` / `127.0.0.1` origin (local development only — such a link
+   resolves on the victim's own machine);
+3. else `https://super-admin.anandi.org`.
+
+> **Deploy action:** set `SUPER_ADMIN_PORTAL_URL` on every backend server. The Tetr
+> backend (`api-v2.tetr.com`) serves a different portal, and without the variable its links
+> would point at `super-admin.anandi.org`.
+
+**Not revealing which emails are super admins.**
+
+- The response is the same for every address: "If an active super admin account exists for
+  this email, a password reset link has been sent to it."
+- The email is sent **after** the response, so response time does not depend on whether the
+  account exists.
+- Per-address cooldown of 60 s (Redis key `sa:forgot-password:<email>`, fails open) stops
+  inbox flooding. The page's "Resend" button waits the same 60 s.
+- Trade-off: if delivery fails, the requester is not told. The failure is logged server-side.
+
+**Password rules** — the same as the admin portal's reset page: at least 8 characters, a
+number, an uppercase and a lowercase letter. Plus a 72-character maximum (bcrypt limit).
+Enforced by the existing `validatePassword` (now exported from
+`super_admin/userController.js`) and mirrored in `authFormUtils.PASSWORD_RULES`. The new
+password must differ from the current one.
+
+**Audit:** a successful reset writes `super_admin.password_reset` (actor = the super admin).
+
+**Errors are inline**, not toasts: the four endpoints are in `INLINE_ERROR_ENDPOINTS` (§18.5).
+
+### 19.3 Contact Administrator
+
+The sign-in page link opens `/contact-administrator`: full name, work email, mobile with
+country picker, and why they need access.
+
+`POST /api/users/auth/super-admin/access-request` `{ name, email, phone, countryCode, countryIso, reason, website }`
+
+- **Recipients:** the `ACCESS_REQUEST_RECIPIENTS` array in the controller (today only
+  `prateek.shukla@mastersunion.org`); add an address to notify more people. Each recipient gets
+  **its own copy**, because the Outbound vendor sends only to the first address of a list
+  (`OutboundVendor.sendSingle` takes `to[0]`). The request counts as sent if at least one copy is
+  delivered; failed addresses are logged. Template `super-admin-access-request`. **Reply-To is the requester**, so replying answers them.
+  `emailService.send` / `sendTemplate` now pass `replyTo` through (additive; existing
+  callers are unaffected).
+- **Validation** (server, mirrored in the form): name 2–80, strict email pattern, country code
+  must match the ISO, phone per country rules, reason 20–2000 characters.
+- **Spam:** `superAdminAccessRequestLimiter` = 5 per hour per IP (Redis-backed, fails open),
+  plus a hidden honeypot field `website` — when it is filled, the API answers success and
+  sends nothing.
+- **Escaping:** every value is HTML-escaped by Handlebars. The reason is escaped first, then
+  line breaks become `<br>` — the only unescaped variable. The subject line uses the name
+  with control characters stripped, so no header injection. The strict email pattern rejects
+  `?` and `&`, so nothing can be smuggled into the `mailto:` link or Reply-To.
+- **Nothing is stored** — the email is the only record. If sending fails, the form shows an
+  error so the requester can retry.
+- The email is responsive down to a 220 px viewport (tables only, inline colours, media
+  queries at 480/360/300/240 px; the avatar hides below 300 px).
+
+### 19.4 Verified (2026-09-13)
+
+- **Endpoint harness — 43/43 pass.** Real router, middleware and controllers on a throwaway
+  Express instance against the v2 DB. Email sending was captured (templates compiled, nothing
+  sent) and `User` / `AuditLog` writes were blocked. DB snapshot identical before and after;
+  all Redis keys the run created were deleted. Covered:
+  - forgot: validation, generic reply for unknown / disabled / admin-only emails, cooldown,
+    localhost link, forged Origin ignored;
+  - verify: real link (masked email, ~15 min), and each rejected case — admin token type,
+    wrong fingerprint, expired, wrong secret, disabled, non-super-admin;
+  - the admin reset endpoint rejects this token;
+  - reset: password rules, mismatch, bad token, and a valid link reaching the save;
+  - access request: honeypot, each validation rule, hostile markup escaped, Reply-To,
+    single-line subject, 6th request from one IP → 429;
+  - phone uniqueness: active duplicate → 409, disabled-only → allowed, other country →
+    allowed, email checked first.
+- **super-admin `vite build`:** passes (705 modules).
+- **Rendered with headless Edge:** both emails at 640 px and 220 px; the sign-in, forgot,
+  contact and reset pages at desktop width.
+- **Not verified:** real email delivery (nothing was sent), and portal-page layout at
+  phone widths (headless Edge would not render them narrower than ~500 px).
+
+### 19.5 Open
+
+| # | Item |
+|---|---|
+| 1 | Set `SUPER_ADMIN_PORTAL_URL` on each backend server (§19.2) |
+| 2 | Existing sessions stay valid after a password reset — `jwtValidator` does not check when the password changed |
+| 3 | `updateMe` has no phone-uniqueness check (§19.1) |
+| 4 | Access requests are not stored; the email is the only record |
+| 5 | `createSuperAdmin`'s onboarding email still builds `loginUrl` from the `Origin` header when `SUPER_ADMIN_PORTAL_URL` is unset — same class of issue as §19.2, lower risk because the caller must be a signed-in super admin |
