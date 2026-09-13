@@ -1022,7 +1022,7 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-09-13 | Super-admin accounts card | ✅ Complete | Fixed list emptied by the search debounce after data arrived; create-drawer errors now inline only (`INLINE_ERROR_ENDPOINTS`). See §18.5. |
 | 2026-09-13 | Test-email 403 mislabelled as a permission error | ✅ Complete | Not RBAC: sender verification. Preview drawers now resolve the org sender (`utils/orgSender.js`). See §18.6. |
 | 2026-09-13 | Unauthenticated `POST /api/users/` creates `super_admin` | 🔴 Open | Unused route, live on api-v2. Recommend removal. See CS6 / §18.4. |
-| 2026-09-13 | Mixed-case staff twin rows break login (kapish) | 🔴 Open | Reset and login resolve different rows. UPDATE proposed, not run. See §18.3. |
+| 2026-08-27 | Mixed-case admin twin rows parked (kapish) | ✅ Complete | Rows 4627803, 4644995, 4749008 renamed to `dup-<id>.<email>`; 0 per-portal twins remain (checked 2026-09-13). Shared `findAuthUserByEmail()` still open. See §18.3. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -3221,8 +3221,9 @@ One email may sit on **three kinds of row at the same time**:
 | admin-portal account | `admin`, `counsellor` (511 active), legacy `user` | admin portal |
 | super admin | `super_admin` | super-admin portal |
 
-This is deliberate. Five super admins use the same plain email as their admin
-account: prateek.shukla, maninder.singh, rajat.puri, ramnika.seth, shilpa.bijalwan.
+This is deliberate. Six super admins use the same plain email as their admin
+account: prateek.shukla, maninder.singh, rajat.puri, ramnika.seth, shilpa.bijalwan,
+and rahul1 (super admin id 4901429, created 2026-09-13; its admin row 4542555 is disabled).
 
 **Every lookup matches only its own portal's role:**
 
@@ -3281,24 +3282,28 @@ Admin-portal and student rows with the same email no longer block creation.
 **`updateMe`** (`userController.js:113`) had the same bug — any role, exact case. It
 now uses the same rule, excluding the user's own row.
 
-### 18.3 Open — mixed-case staff twins break login (the kapish case)
+### 18.3 Fixed 2026-08-27 — mixed-case admin twins broke login (the kapish case)
 
-`kapish.sabharwal@mastersunion.org` has two staff rows whose emails differ only by case.
+`kapish.sabharwal@mastersunion.org` had two admin rows whose emails differed only by case.
 
-1. `forgotPassword` tries an exact match first → it resets the **lowercase** row.
-2. `adminLoginV2` uses `LOWER(email)` with no `ORDER BY` → it can pick the **capital-K** row.
+1. `forgotPassword` tries an exact match first → it reset the **lowercase** row.
+2. `adminLoginV2` uses `LOWER(email)` with no `ORDER BY` → it could pick the **capital-K** row.
 3. Result: "Incorrect Password" straight after a successful reset.
 
-Two more users have the same shape. Proposed, **not run** (awaiting approval):
+**Data fix — already applied on 2026-08-27.** The orphan rows were parked by renaming
+their email, so they no longer match any login:
 
-```sql
--- park the orphan rows so each staff email resolves to exactly one row
-UPDATE users SET email = 'dup-' || id || '.' || email, updated_at = NOW()
- WHERE id IN (4627803, 4749008, 4644995);
-```
+| id | email now |
+|---|---|
+| 4627803 | `dup-4627803.Kapish.sabharwal@mastersunion.org` |
+| 4644995 | `dup-4644995.Preetika.bhachu@mastersunion.org` |
+| 4749008 | `dup-4749008.Devam.chandna@mastersunion.org` |
 
-Code follow-up: one shared `findAuthUserByEmail()` (exact match first, then
-case-insensitive) used by both login and password reset, so they can never disagree.
+Checked 2026-09-13: **0** emails sit on more than one admin-portal row, and **0** on more
+than one super_admin row.
+
+**Still open (code):** one shared `findAuthUserByEmail()` (exact match first, then
+case-insensitive) used by both login and password reset, so they can never disagree again.
 
 ### 18.4 Security — `POST /api/users/` creates a super admin with no login
 
@@ -3435,14 +3440,53 @@ Each query copied exactly from the new code, run through Sequelize:
 - Generated SQL for super-admin login:
   `… FROM "users" AS "User" WHERE (LOWER("email") = …) AND "User"."role" = 'super_admin' ORDER BY CASE WHEN "User"."status" = 'active' THEN 0 ELSE 1 END ASC, "User"."id" DESC LIMIT 1`
 
+### 18.8.2 Pre-release review (2026-09-13)
+
+**Real controllers, writes blocked.** The changed functions were imported and called with
+mock `req`/`res` against the v2 DB. `User.create/update/save/destroy`,
+`AuditLog.create` and the credentials email were stubbed to throw, and the Google Chat
+notifier was off (`NODE_ENV=development`). Result: **22/22 pass**. `users` max id, row
+count, `audit_logs` max id and the touched rows' `updated_at` were identical before and after.
+
+| Area | Cases |
+|---|---|
+| `superAdminLogin` | active + wrong password → 401 · UPPERCASE email found · disabled → 403 · admin-only email → 401 not found |
+| `adminLoginV2` | all 6 twins reach the password check (no 403) · rahul1 → 403 disabled (its admin row) · super-admin-only email → 401 not found · normal admin, student-only email |
+| legacy `adminLogin` | twin reaches the password check |
+| `createSuperAdmin` | existing / different case / disabled → 409 with the right message · admin-only and student-only emails pass the check |
+| `updateMe` | another super admin's email → 409 · own email and admin-only email pass the check |
+
+**Query plans** (`EXPLAIN ANALYZE`): every changed lookup uses `users_email_lower_idx` or
+`users_email_status`, 0.04–0.10 ms. The two `ILIKE` paths (legacy `adminLogin`,
+`forgotPassword` fallback) are parallel seq scans of ~180–210 ms — **identical to before**
+(119,191 buffers old and new), so not a regression.
+
+**Lint:** 0 errors; the same 8 pre-existing warnings as `HEAD`.
+
+**Intended behaviour changes to expect after release:**
+
+| Situation | Before | After |
+|---|---|---|
+| Admin login, email has an admin row and a super_admin row | arbitrary row; super_admin row → 403 | always the admin row |
+| Admin login, email is super-admin-only | 403 "not allowed to log in from this portal" | 401 "No account found…" |
+| Forgot password, super-admin-only email | row found, send fails (no org → no sender; there is no global vendor row) | 404 "Account not found" |
+| Org creation / v2 create user with a super-admin-only email | org creation blocked; create user attached org roles to the super_admin row (unusable) | a separate admin account is created and emailed its credentials |
+| Super admin with status `invited` | could log in | 403 "Your account is not active yet" (none exist today) |
+
+No migration and no data change are needed. Rollback = revert the four files.
+
 ### 18.9 Open, not fixed
 
 | # | Item | See |
 |---|---|---|
 | 1 | Remove unauthenticated `POST /api/users/`; review super admins it may have created | CS6, §18.4 |
-| 2 | Park the 3 mixed-case admin twin rows; add shared `findAuthUserByEmail()` | §18.3 |
+| 2 | Shared `findAuthUserByEmail()` so login and reset can never resolve different rows (the rows themselves were parked 2026-08-27) | §18.3 |
 | 3 | Test-email sender failure should not be HTTP 403 | §18.6 |
 | 4 | Role 58 / Chandana visibility-scope decision | §18.7 |
-| 5 | No DB unique index **per portal** — partial `UNIQUE (LOWER(email)) WHERE role = 'super_admin'` and `… WHERE role NOT IN ('student','super_admin')` would enforce §18.1, but only after #2 is cleaned up | §18.1 |
+| 5 | No DB unique index **per portal** — partial `UNIQUE (LOWER(email)) WHERE role = 'super_admin'` and `… WHERE role NOT IN ('student','super_admin')` would enforce §18.1 — data already has 0 twins per portal (checked 2026-09-13) | §18.1 |
 | 6 | `jwtValidator.js:92` blocks only `disabled`, so a token issued to a now-`invited` user keeps working | §18.8 |
 | 7 | Legacy `org/:orgId/rbac/createUser` (`controllers/rbac/usersController.js`) still rejects an email that exists on **any** row, students included | §18.1 |
+| 8 | Phone OTP login (`POST /api/users/auth/send-otp`, `verify-otp`, `otpController.js`) looks up `users` by phone with **no role filter** and signs a JWT for whatever row it finds, `super_admin` included. No frontend calls it. Super admins rajat.puri (4899993) and rohit.yadav (4901416) share phone 9000007063 | §18.8.2 |
+| 9 | `createSuperAdmin` has no phone-uniqueness check (see #8) | §18.8.2 |
+| 10 | Student email-OTP also sends a WhatsApp copy via `karixAuthOtp.service.sendKarixAuthOtp`, which looks up `email ILIKE x` with no role filter — for a twin it may use another row's phone | §18.8.2 |
+| 11 | Org audit actor page (`v2/controllers/auditLogController.js`, fallback when no `actorId`) resolves the display user by email with no role filter | §18.8.2 |
