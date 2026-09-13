@@ -1018,7 +1018,7 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-08-12 | RBAC endpoint performance | ✅ Complete | Sequelize multi-include cartesian (159,840 rows for ~81 rows of data): `/rbac/me/context` 8.5s → 0.35s, `/rbac/users/:id` 6.4s → 0.40s. Dashboard no longer blocks on `me/context`. See §16. |
 | 2026-08-13 | Form-scoped visibility (`roles.visibility_scope`) | ✅ Complete | Third scope axis: a role can see every lead on its members' allocated application forms, OR'd with the reporting downline. Reporting managers inherit a form-scoped report's view. All lead surfaces + dashboard tiles resolve through one function (`resolveActorVisibility`). Role editor toggle added; profile page now shows the user's reporting line. See §15. |
 | 2026-08-28 | `getSystemUser()` cached — 91% DB load | ✅ Complete | Uncached `users WHERE role = 'super_admin'` seq scan (657 MB, 3 CPUs) ran per WhatsApp/SMS delivery event. Cached per process; deliberately **not** indexed (would change the `LIMIT 1` row and re-attribute system records). See §17. |
-| 2026-09-13 | Staff duplicate-email rule; super-admin create fixed | ✅ Complete | `users.email` is not unique; student rows are a separate identity. `createSuperAdmin` now ignores student rows and compares case-insensitively. `updateMe` still has the old check (open). See §18.1–18.2. |
+| 2026-09-13 | Per-portal user identity; super-admin create + login fixed | ✅ Complete | One email may be a student, an admin-portal and a super_admin row. Admin lookups now `role NOT IN ('student','super_admin')` — fixes 403 admin login for 3 super admins with same-email admin accounts. Create/updateMe duplicate checks only see super_admin rows. Super-admin login requires `active` and prefers the active row. See §18.1, 18.2, 18.8. |
 | 2026-09-13 | Super-admin accounts card | ✅ Complete | Fixed list emptied by the search debounce after data arrived; create-drawer errors now inline only (`INLINE_ERROR_ENDPOINTS`). See §18.5. |
 | 2026-09-13 | Test-email 403 mislabelled as a permission error | ✅ Complete | Not RBAC: sender verification. Preview drawers now resolve the org sender (`utils/orgSender.js`). See §18.6. |
 | 2026-09-13 | Unauthenticated `POST /api/users/` creates `super_admin` | 🔴 Open | Unused route, live on api-v2. Recommend removal. See CS6 / §18.4. |
@@ -3211,26 +3211,47 @@ point at the real automation user (id 4441913).
 legitimately sits on many rows — `rohit.yadav@mastersunion.org` has 4 student rows.
 Read this before writing any "does this email already exist?" check.
 
-### 18.1 The identity rule
+### 18.1 The identity rule — identity is per portal (decided 2026-09-13)
 
-- **Student rows are a separate identity.** One person can be a student (often on
-  several rows) and also be staff. A student row never blocks a staff account.
-- **Staff rows (`admin`, `super_admin`) must be unique per email, ignoring case, in
-  every status.** Every staff auth lookup silently assumes this:
+One email may sit on **three kinds of row at the same time**:
+
+| Row kind | `users.role` | Logs in to |
+|---|---|---|
+| student (often several) | `student` | student portal |
+| admin-portal account | `admin`, `counsellor` (511 active), legacy `user` | admin portal |
+| super admin | `super_admin` | super-admin portal |
+
+This is deliberate. Five super admins use the same plain email as their admin
+account: prateek.shukla, maninder.singh, rajat.puri, ramnika.seth, shilpa.bijalwan.
+
+**Every lookup matches only its own portal's role:**
 
 | Lookup | Where | Filter |
 |---|---|---|
-| `adminLoginV2` | `controllers/users/authController.js:344` | `LOWER(email) = x AND role <> 'student'` |
-| `superAdminLogin` | `controllers/users/authController.js:159` | `LOWER(email) = x AND role = 'super_admin'` (no status filter) |
-| `forgotPassword` | `controllers/users/authController.js:744` | exact `email = x`, then `ILIKE`; `role <> 'student'` |
-| v2 `createUser` | `v2/services/userService.js:789` | `email = x AND role <> 'student'` |
+| `superAdminLogin` | `controllers/users/authController.js:150` | `LOWER(email) = x AND role = 'super_admin'`, active row first |
+| `adminLoginV2` | `controllers/users/authController.js:368` | `LOWER(email) = x AND role NOT IN ('student','super_admin')` |
+| legacy `adminLogin` | `controllers/users/authController.js:55` | `email ILIKE x AND role NOT IN ('student','super_admin')` |
+| `forgotPassword` | `controllers/users/authController.js:762, 767` | exact, then `ILIKE`; `role NOT IN ('student','super_admin')` |
+| student login | `controllers/users/authController.js:537` | `role = 'student'` |
+| v2 `createUser` (drawer + bulk upload) | `v2/services/userService.js:791` | `email = x AND role NOT IN ('student','super_admin')` |
+| org bootstrap Admin | `v2/services/orgBootstrapService.js:135` | same as above |
+| `createSuperAdmin` duplicate check | `controllers/super_admin/userController.js:217` | `LOWER(email) = x AND role = 'super_admin'`, any status |
+| `updateMe` duplicate check | `controllers/super_admin/userController.js:113` | same, excluding self |
 
-None of them has an `ORDER BY`. If two staff rows share an email, which one you get
-is arbitrary — the same trap as §17.4.
+**Why.** Before this, the admin lookups used `role <> 'student'` with no `ORDER BY`.
+That also matches the `super_admin` twin, and Postgres returned either row. For
+prateek.shukla, rajat.puri and shilpa.bijalwan it returned the super_admin row, and
+admin login answered **403 "You are not allowed to log in from this portal"**. Rajat's
+admin account last logged in on 2026-09-11 06:16 — six hours before his super admin
+twin was created. Maninder's lookup happened to return his admin row, so he could still
+log in.
 
-> **Rule.** A duplicate-email check for a staff account must (1) ignore student rows,
-> (2) compare with `LOWER(email)`, and (3) include every status, `disabled` too —
-> `superAdminLogin` does not filter status, so a disabled twin can shadow the live one.
+> **Rule.** Never write `role <> 'student'` to mean "admin portal" — it also matches
+> `super_admin`. Write `role NOT IN ('student', 'super_admin')`. Do **not** narrow it
+> to `role = 'admin'`: counsellor rows log in to the admin portal too.
+
+Twins **inside one portal** are still a bug — e.g. two admin rows that differ only by
+case (§18.3).
 
 ### 18.2 Fixed — "A user with this email already exists" for a brand-new super admin
 
@@ -3242,21 +3263,23 @@ is arbitrary — the same trap as §17.4.
 route `POST /api/super_admin/users/accounts`) checked `where: { email }` — any role,
 any status. It matched Rohit's 4 student rows.
 
-**Fix** (`userController.js:204`). The check is now `LOWER(email) = x AND role <> 'student'`,
-and the message says what it clashed with:
+**Fix** (`userController.js:217`). Per §18.1, only another **super_admin** row with the
+email is a conflict — in any status, compared with `LOWER(email)`:
 
-| Existing staff row | Message |
+| Existing super_admin row | Message |
 |---|---|
-| `super_admin`, active | A super admin with this email already exists |
-| `super_admin`, disabled | A deleted super admin account with this email already exists |
-| `admin` | An admin account with this email already exists |
+| active | A super admin with this email already exists |
+| disabled | A deleted super admin account with this email already exists |
 
-**Verified** (read-only, v2 DB): `rohit.yadav@…` → no conflict (the old rule matched 4 rows);
-existing super admin id 4899981 → still blocked; existing admin id 6001 → still blocked.
+Admin-portal and student rows with the same email no longer block creation.
 
-**Same bug, not fixed:** `updateMe` (`userController.js:107`) still checks
-`email = x AND id <> me` — any role, exact case. A super admin changing their own email
-to an address that has student rows is wrongly rejected.
+> **History.** The first fix that day blocked on any non-student row. It rejected
+> `rahul1@mastersunion.org` with "An admin account with this email already exists",
+> because of a **disabled admin** row (id 4542555), not a super admin. It was replaced the
+> same day by the per-portal decision.
+
+**`updateMe`** (`userController.js:113`) had the same bug — any role, exact case. It
+now uses the same rule, excluding the user's own row.
 
 ### 18.3 Open — mixed-case staff twins break login (the kapish case)
 
@@ -3380,13 +3403,46 @@ permission configured anywhere.
   users). Move Chandana to an existing forms role (40 "Admin View Only" / 56
   "Executive View") instead.
 
-### 18.8 Open, not fixed
+### 18.8 Super-admin login — only `active` accounts, active row first
+
+`users.status` is `active | disabled | invited`. `superAdminLogin` only rejected
+`disabled`, so an `invited` super admin could sign in. (No super admin is `invited`
+today — 11 active, 7 disabled — so nobody was affected.)
+
+- **Lookup** (`authController.js:150`): `ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, id DESC`.
+  An old disabled row can no longer shadow a live one with the same email.
+- **Status** (`authController.js:184`): anything other than `active` → 403. `disabled`
+  keeps "Your account has been disabled"; `invited` gets "Your account is not active yet".
+- Status is checked **after** the lookup, not in `WHERE`. Putting it in `WHERE` would
+  turn "Your account has been disabled" into "No super admin account found".
+
+### 18.8.1 Verified (read-only, v2 DB, 2026-09-13)
+
+Each query copied exactly from the new code, run through Sequelize:
+
+| Email | superAdminLogin | adminLoginV2 before | adminLoginV2 after | forgotPassword | createSuperAdmin |
+|---|---|---|---|---|---|
+| prateek.shukla@ | 4899981 super_admin | **4899981 super_admin → 403** | 4545950 admin | 4545950 admin | conflict (super admin) |
+| maninder.singh@ | 4899990 super_admin | 4748332 admin | 4748332 admin | 4748332 admin | conflict (super admin) |
+| rajat.puri@ | 4899993 super_admin | **4899993 super_admin → 403** | 4546692 admin | 4546692 admin | conflict (super admin) |
+| ramnika.seth@ | 4899992 super_admin | 4627796 admin | 4627796 admin | 4627796 admin | conflict (super admin) |
+| shilpa.bijalwan@ | 4899996 super_admin | **4899996 super_admin → 403** | 4546847 admin | 4546847 admin | conflict (super admin) |
+| rahul1@ | none | 4542555 admin (disabled) | 4542555 admin (disabled) | 4542555 | **allowed** |
+| rohit.yadav@ | 4901416 super_admin | 4901416 super_admin | none | none | conflict (super admin) |
+
+- New admin lookup run 125 times over the 5 twins: returned a super_admin row **0** times.
+- A counsellor account (id 4645091) still resolves through admin login.
+- Generated SQL for super-admin login:
+  `… FROM "users" AS "User" WHERE (LOWER("email") = …) AND "User"."role" = 'super_admin' ORDER BY CASE WHEN "User"."status" = 'active' THEN 0 ELSE 1 END ASC, "User"."id" DESC LIMIT 1`
+
+### 18.9 Open, not fixed
 
 | # | Item | See |
 |---|---|---|
 | 1 | Remove unauthenticated `POST /api/users/`; review super admins it may have created | CS6, §18.4 |
-| 2 | Park the 3 mixed-case staff twin rows; add shared `findAuthUserByEmail()` | §18.3 |
-| 3 | `updateMe` duplicate-email check: same bug as §18.2 | §18.2 |
-| 4 | Test-email sender failure should not be HTTP 403 | §18.6 |
-| 5 | Role 58 / Chandana visibility-scope decision | §18.7 |
-| 6 | No DB unique index for staff emails — a partial `UNIQUE (LOWER(email)) WHERE role <> 'student'` would enforce §18.1, but only after #2 is cleaned up | §18.1 |
+| 2 | Park the 3 mixed-case admin twin rows; add shared `findAuthUserByEmail()` | §18.3 |
+| 3 | Test-email sender failure should not be HTTP 403 | §18.6 |
+| 4 | Role 58 / Chandana visibility-scope decision | §18.7 |
+| 5 | No DB unique index **per portal** — partial `UNIQUE (LOWER(email)) WHERE role = 'super_admin'` and `… WHERE role NOT IN ('student','super_admin')` would enforce §18.1, but only after #2 is cleaned up | §18.1 |
+| 6 | `jwtValidator.js:92` blocks only `disabled`, so a token issued to a now-`invited` user keeps working | §18.8 |
+| 7 | Legacy `org/:orgId/rbac/createUser` (`controllers/rbac/usersController.js`) still rejects an email that exists on **any** row, students included | §18.1 |
