@@ -1,5 +1,5 @@
 # Users / Roles / Permissions Module — Deep Analysis
-> Maintained by AI Agent | Last Updated: 2026-09-13 (Implementation In Progress)
+> Maintained by AI Agent | Last Updated: 2026-09-14 (Implementation In Progress)
 > Branch: `users` | All new work → `v2` folder (backend) and `pages/Admin/v2/` (frontend)
 
 ---
@@ -1027,6 +1027,7 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-09-13 | Super admin phone number unique | ✅ Complete | `createSuperAdmin` rejects a phone + country ISO already held by a non-deleted super admin. See §19.1. |
 | 2026-09-13 | Super-admin portal forgot password | ✅ Complete | Public forgot → verify link → reset flow; 15-min single-use token bound to the password hash; link host never taken from request headers. See §19.2. |
 | 2026-09-13 | Super-admin portal Contact Administrator | ✅ Complete | Public access-request form emails the platform owner; honeypot, 5/hour per IP, all input escaped. See §19.3. |
+| 2026-09-14 | Super admin accounts: creator, created and last login | ✅ Complete | Each row in the *Super admin accounts* card shows who created the account (from its `super_admin.create` audit row), when, and the last sign-in. See §18.5 c. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -3376,6 +3377,27 @@ plus the global `rtkErrorMiddleware`) and the red `DrawerError`.
 
 To make another screen inline-only: add its RTK `endpointName` to the set and do not
 `pushToast` in its `catch`.
+
+**c) Each account row shows who created it, when, and the last login — added 2026-09-14.**
+Under the email, every row now reads e.g. *"Created 11 Sep 2026 by Prateek Super Admin"*
+and *"Last login 14 Sep 2026, 3:01 PM"* (or *"Never signed in"*). When the creator is the
+signed-in super admin it says *"by you"*; hovering the line shows the creator's email.
+
+| Shown | Source |
+|---|---|
+| Created on | `users.created_at` |
+| Created by | the `audit_logs` row `action = 'super_admin.create'`, `target_type = 'super_admin'`, `target_id = <user id>` — its `actor` (current name/email), falling back to `actor_email` |
+| Last login | `users.last_logged_in_at`, set by `superAdminLogin` on each successful sign-in |
+
+- `users` has **no `created_by` column**. `createSuperAdmin` writes the audit row in the same
+  transaction as the user, so every account created through the portal has one.
+  Checked 2026-09-14 on the v2 DB: all 12 non-disabled super admins have exactly one.
+- Backend: `listSuperAdmins` (`super_admin/userController.js`) adds `createdBy: { id, name, email } | null`
+  to each user. One extra query per page (`audit_logs_target_idx`). `publicSuperAdmin` is unchanged,
+  so audit `before`/`after` snapshots do not start carrying `createdBy`.
+- `createdBy` is `null` for an account created outside the portal (seed, SQL, the legacy
+  `POST /api/users/` route in §18.4); the row then shows only *"Created <date>"*.
+- Frontend: `AccountFacts` in `SuperAdminProfilePage.jsx`.
 
 ### 18.6 Said "no permission", was not RBAC — test-email 403
 
