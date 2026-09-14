@@ -1028,6 +1028,7 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-09-13 | Super-admin portal forgot password | ✅ Complete | Public forgot → verify link → reset flow; 15-min single-use token bound to the password hash; link host never taken from request headers. See §19.2. |
 | 2026-09-13 | Super-admin portal Contact Administrator | ✅ Complete | Public access-request form emails the platform owner; honeypot, 5/hour per IP, all input escaped. See §19.3. |
 | 2026-09-14 | Super admin accounts: creator, created and last login | ✅ Complete | Each row in the *Super admin accounts* card shows who created the account (from its `super_admin.create` audit row), when, and the last sign-in. See §18.5 c. |
+| 2026-09-14 | Super-admin reset link host | ✅ Complete | The portal sends `portalUrl` (`window.location.origin`) with forgot-password, access-request and create-super-admin; email links are built on it. Trusted-host list, env var and default host removed. Poisoning risk accepted — see §19.2. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -3574,19 +3575,37 @@ sign in.
 - Cannot be used on the admin portal's `/auth/reset-password` (different `type`), and the
   admin portal's token cannot be used here.
 
-**Where the link points — never from the request.** CORS on this API accepts every origin,
-and anyone can call it with a forged `Origin` header. Building the link from that header
-would email a real super admin a working token that points at an attacker's site. The link
-host is resolved as:
+**Where the link points — the portal address sent by the frontend (2026-09-14).**
+The super-admin portal sends `portalUrl: window.location.origin` in the request body
+(`authApi.js` for forgot password and access request, `superAdminProfileApi.js` for
+create). The backend keeps only protocol + host (`normalizePortalUrl` in
+`super_admin/userController.js`) and builds the link on it:
 
-1. `SUPER_ADMIN_PORTAL_URL` env var, if set;
-2. else a `http://localhost` / `127.0.0.1` origin (local development only — such a link
-   resolves on the victim's own machine);
-3. else `https://super-admin.anandi.org`.
+| Email | Link |
+|---|---|
+| Password reset | `<portalUrl>/reset-password?token=…` |
+| Contact Administrator (to the platform team) | `<portalUrl>/profile` |
+| New super admin credentials (`createSuperAdmin`) | `<portalUrl>` |
 
-> **Deploy action:** set `SUPER_ADMIN_PORTAL_URL` on every backend server. The Tetr
-> backend (`api-v2.tetr.com`) serves a different portal, and without the variable its links
-> would point at `super-admin.anandi.org`.
+- Missing or not an `http(s)` URL, or containing `user:password@` → **400 "A valid portal URL
+  is required"**, nothing sent. Path, query and hash are dropped.
+- Headers (`Origin`, `Referer`), the `SUPER_ADMIN_PORTAL_URL` env var and any default host are
+  **not** used any more. The earlier trusted-host list (`src/utils/superAdminPortalUrl.js`)
+  was removed at the product owner's request.
+
+> **Risk accepted by product owner — reset-link poisoning.** The endpoint is public and the
+> backend does not restrict `portalUrl` to our own hosts. Anyone can call
+> `forgot-password` with a real super admin's email and `portalUrl: "https://attacker.site"`.
+> The super admin then receives a genuine Lead Matrix email whose button opens the attacker's
+> site with a **working 15-minute reset token** in the URL, which the attacker can use to set
+> a new password and take over the account. The same applies to the onboarding email, but only
+> a signed-in super admin can trigger that. The mitigation, if wanted, is to accept
+> `portalUrl` only when its origin is on a list of our own portal hosts.
+
+> **History.** A reset requested on `https://superadminv2.mastersunion.org` emailed a
+> `https://super-admin.anandi.org` link, because `SUPER_ADMIN_PORTAL_URL` was not set on the
+> api-v2 server and the fallback was the old host. Fixed by sending the portal address from
+> the frontend.
 
 **Not revealing which emails are super admins.**
 
@@ -3643,7 +3662,7 @@ country picker, and why they need access.
   sent) and `User` / `AuditLog` writes were blocked. DB snapshot identical before and after;
   all Redis keys the run created were deleted. Covered:
   - forgot: validation, generic reply for unknown / disabled / admin-only emails, cooldown,
-    localhost link, forged Origin ignored;
+    link built on the sent `portalUrl` (headers ignored), missing / non-http / credential-bearing `portalUrl` → 400, path stripped;
   - verify: real link (masked email, ~15 min), and each rejected case — admin token type,
     wrong fingerprint, expired, wrong secret, disabled, non-super-admin;
   - the admin reset endpoint rejects this token;
@@ -3662,8 +3681,8 @@ country picker, and why they need access.
 
 | # | Item |
 |---|---|
-| 1 | Set `SUPER_ADMIN_PORTAL_URL` on each backend server (§19.2) |
+| 1 | `portalUrl` is not restricted to our own hosts — reset-link poisoning risk accepted 2026-09-14 (§19.2) |
 | 2 | Existing sessions stay valid after a password reset — `jwtValidator` does not check when the password changed |
 | 3 | `updateMe` has no phone-uniqueness check (§19.1) |
 | 4 | Access requests are not stored; the email is the only record |
-| 5 | `createSuperAdmin`'s onboarding email still builds `loginUrl` from the `Origin` header when `SUPER_ADMIN_PORTAL_URL` is unset — same class of issue as §19.2, lower risk because the caller must be a signed-in super admin |
+| 5 | ~~`createSuperAdmin`'s onboarding email builds `loginUrl` from the `Origin` header~~ — changed 2026-09-14, uses the `portalUrl` the frontend sends (§19.2) |
