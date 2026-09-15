@@ -3772,7 +3772,10 @@ PUT rules (`userPermissionOverrideService.syncUserPermissionOverrides`):
 - **Manage Users → row ⋮ → Permissions** (shown with `manage-users.manage-users.edit`) →
   `/admin/manage-users/:userId/permissions` → `UserPermissionOverridesV2.jsx`.
 - Same module tree + action cards as the role editor. A checkbox is the **effective** state;
-  each card is tagged *From role* / *Granted to user* / *Revoked for user*.
+  each card is tagged *Comes with their role* / *Extra access* / *Blocked for this user*.
+  The header shows the user, their roles, and two counters — **Extra access given** (active
+  grants) and **Access taken away** (active revokes). Both count only the user's own
+  overrides, never the permissions their role gives.
 - On save, overrides are derived relative to the roles: checked-but-not-from-role → grant;
   unchecked-but-from-role → revoke; matches roles → none. An action the admin did not change
   keeps its existing override.
