@@ -1,5 +1,5 @@
 # Users / Roles / Permissions Module — Deep Analysis
-> Maintained by AI Agent | Last Updated: 2026-09-14 (Implementation In Progress)
+> Maintained by AI Agent | Last Updated: 2026-09-15 (Implementation In Progress)
 > Branch: `users` | All new work → `v2` folder (backend) and `pages/Admin/v2/` (frontend)
 
 ---
@@ -25,6 +25,7 @@
 17. [`users.role` — Why It Is Neither an Authority Nor an Index](#17-usersrole--why-it-is-neither-an-authority-nor-an-index--2026-08-28)
 18. [One Email, Several `users` Rows — Identity, Duplicates & Super-Admin Accounts](#18-one-email-several-users-rows--identity-duplicates--super-admin-accounts--2026-09-13)
 19. [Super-Admin Portal — Forgot Password, Access Requests, Phone Uniqueness](#19-super-admin-portal--forgot-password-access-requests-phone-uniqueness--2026-09-13)
+20. [Per-User Extra Permissions — Grant / Revoke on Top of Roles](#20-per-user-extra-permissions--grant--revoke-on-top-of-roles--2026-09-15)
 
 ---
 
@@ -1029,6 +1030,7 @@ This menu item is manually injected in NewSidemenuV2. Should it be added as a pr
 | 2026-09-13 | Super-admin portal Contact Administrator | ✅ Complete | Public access-request form emails the platform owner; honeypot, 5/hour per IP, all input escaped. See §19.3. |
 | 2026-09-14 | Super admin accounts: creator, created and last login | ✅ Complete | Each row in the *Super admin accounts* card shows who created the account (from its `super_admin.create` audit row), when, and the last sign-in. See §18.5 c. |
 | 2026-09-14 | Super-admin reset link host | ✅ Complete | The portal sends `portalUrl` (`window.location.origin`) with forgot-password, access-request and create-super-admin; email links are built on it. Trusted-host list, env var and default host removed. Poisoning risk accepted — see §19.2. |
+| 2026-09-15 | Per-user extra permissions (grant / revoke) | ✅ Complete (not yet migrated/deployed) | New `user_action_overrides` table; applied in both `getUserRbacContext` and `getAllControls`; Manage Users → ⋮ → Permissions page. See §20. |
 
 ## FINAL DECISIONS (from Prateek's answers — Round 1)
 
@@ -3686,3 +3688,132 @@ country picker, and why they need access.
 | 3 | `updateMe` has no phone-uniqueness check (§19.1) |
 | 4 | Access requests are not stored; the email is the only record |
 | 5 | ~~`createSuperAdmin`'s onboarding email builds `loginUrl` from the `Origin` header~~ — changed 2026-09-14, uses the `portalUrl` the frontend sends (§19.2) |
+
+---
+
+## 20. Per-User Extra Permissions — Grant / Revoke on Top of Roles — 2026-09-15
+
+An admin can give one user an action none of their roles has (**grant**), or take away an
+action a role gives them (**revoke**), without creating or changing a role.
+
+### 20.1 Decisions (confirmed 2026-09-15)
+
+| Question | Decision |
+|---|---|
+| Scope | Per **user in the org**; applies whichever role they sign in with |
+| Precedence | effective = (role actions ∪ grants) − revokes. **Revoke wins.** The org ceiling (`org_modules` / `org_actions`) still caps the result |
+| Who can set | Same as editing role permissions: `manage-users.manage-users.edit`; target's highest level ≤ actor's level; an org Admin (level 6 or `internalId='admin'`) or super admin may set any action in the ceiling, anyone else only actions they hold |
+| Expiry | None (an override stays until removed) |
+| Extra safety rules | Nobody can change **their own** overrides. Overrides are **ignored for a user with no active role** in the org — a roleless user has `effectiveLevel = null`, which several services treat as unrestricted |
+
+Scope is **action keys only**. Stage access (§14) and whose records a user sees (§15, role
+level + reporting tree) are unchanged and still come from roles.
+
+### 20.2 Data
+
+`user_action_overrides` — migration `20260920120000-create-user-action-overrides.cjs`, model `models/UserActionOverride.js`.
+
+| Column | Notes |
+|---|---|
+| `user_id`, `org_id`, `action_id` | FKs (CASCADE); **unique (user_id, org_id, action_id)** |
+| `effect` | `'grant'` \| `'revoke'` (CHECK constraint) |
+| `is_active` | removing an override sets `false`; rows are never deleted by the app |
+| `updated_by` | FK users, SET NULL |
+
+Partial index `(user_id, org_id) WHERE is_active` serves the per-request lookup.
+The migration is idempotent (`showAllTables` / `IF NOT EXISTS`).
+
+### 20.3 Where it is applied — both permission builders
+
+Permissions are computed in two places. Both call `v2/services/userActionOverrideLoader.js`:
+
+| Builder | Used by |
+|---|---|
+| `rbacService.getUserRbacContext` | `rbacMiddleware.requireAction` (API enforcement), role/user services |
+| `permissionsService.getAllControls` | `/controls/:userId` → sidebar, `useRBACPermissions.hasAction` |
+
+- `loadUserActionOverrides` — active rows for the user+org. **Missing table (`42P01`) → no
+  overrides** with a one-time warning, so deploying code before the migration cannot take
+  the portal down. Any other DB error is rethrown (fail closed — silently dropping revokes
+  would restore access an admin removed).
+- `mergeRoleActionsWithOverrides` — drops revoked role rows, appends granted actions
+  (`roleId: null, source: 'user_grant'`). The org ceiling is applied afterwards by the
+  existing code, unchanged.
+- Only runs when the user has ≥ 1 active role (for the acting role, when one is selected).
+- The RBAC context now also carries `userActionOverrides` and `allowedActions[].source`.
+  `effectiveLevel` is never affected.
+
+> Legacy v1 `controllers/rbac/majorRbacController.getAllControls` (`/api/org/:orgId/rbac/controls`)
+> is **not** override-aware. The v2 admin portal does not use it.
+
+### 20.4 API
+
+| Method + path (under `/api/v2/org/:orgId/rbac`) | Gate | Body / response |
+|---|---|---|
+| `GET /users/:userId/permission-overrides` | `manage-users.manage-users.view` | `{ user, roles, canEdit, editBlockedReason, summary: { granted, revoked }, modulesTree }` — each action: `fromRole`, `override`, `effective`, `assignable` |
+| `PUT /users/:userId/permission-overrides` | `manage-users.manage-users.edit` | `{ grants: number[], revokes: number[] }` — the **full** sets; returns `{ changed, granted, revoked }` |
+
+PUT rules (`userPermissionOverrideService.syncUserPermissionOverrides`):
+- 400: not arrays / bad ids / unknown or inactive action / an id in both lists / outside the
+  org ceiling / target has no role (unless clearing); 403: self, target level higher, or a
+  non-admin **changing** an action they don't hold; 404: user not in org.
+- The "must hold the action" check runs on **changed** actions only, so a manager can still
+  save a user who carries an Admin-set override on an action the manager lacks.
+- Overrides on actions outside the current ceiling are **left untouched** by a save (they
+  have no effect and the editor can't show them).
+- One transaction, serialised per user+org with `pg_advisory_xact_lock` (the first save has
+  no rows to lock). Audit row `target_type='user_action_overrides'`,
+  `action='user.syncPermissionOverrides'`, before/after `{ grants, revokes }` plus
+  `_labels.actions` (id → key) and `_userEmail`; listed under the **Permission** audit category.
+- After commit: `invalidateUserRbacContext` for the target (all role variants).
+
+### 20.5 Frontend (fe-anandi)
+
+- **Manage Users → row ⋮ → Permissions** (shown with `manage-users.manage-users.edit`) →
+  `/admin/manage-users/:userId/permissions` → `UserPermissionOverridesV2.jsx`.
+- Same module tree + action cards as the role editor. A checkbox is the **effective** state;
+  each card is tagged *From role* / *Granted to user* / *Revoked for user*.
+- On save, overrides are derived relative to the roles: checked-but-not-from-role → grant;
+  unchecked-but-from-role → revoke; matches roles → none. An action the admin did not change
+  keeps its existing override.
+- Read-only with an explanation for self and for users with no role.
+- RTK: `v2GetUserPermissionOverrides` / `v2SyncUserPermissionOverrides` (tag
+  `v2Users:permission-overrides-<userId>`).
+
+### 20.6 Verified (2026-09-15) — local copy, not the v2 DB
+
+A Docker Postgres 17 built from the v2 DB **schema** plus org 12's RBAC data (82 modules,
+339 actions, 24 roles, 1,644 role actions, org ceiling) and one real user at each of levels
+6/5/4/3/2/1. Source was read in read-only sessions; nothing was written to `anandi`. Local
+Redis. **52/52 pass**, including:
+
+- **Regression:** with no overrides, the HEAD versions of `rbacService` / `permissionsService`
+  and the new ones return **identical** contexts and controls for 18 user/role variants; again
+  after overrides were added and cleared; other users unchanged while one user has overrides.
+- Grant/revoke take effect through `requireAction` (acting role and `role:all`), sidebar
+  controls agree with enforcement, tree "effective" set equals the enforced set (35 = 35).
+- Cache: warmed context is invalidated by a save. Roleless user: stored grant ignored, level
+  stays `null`. Acting as a role not held → nothing.
+- All 400/403/404 rules above; manager preserve rule; super-admin bypass flag; out-of-ceiling
+  row preserved; audit row + summary text; rollback when the audit insert fails; two
+  concurrent first saves both succeed with one row; missing table falls back to role-only;
+  other DB errors propagate.
+- HTTP through the real router (`jwtValidator` + `requireAction`): 200 / 200 / 403 / 400.
+- Migration runs twice cleanly; CHECK rejects other effects. be-anandi ESLint clean;
+  fe-anandi production build passes.
+- **Not verified:** the page in a browser, and anything on the real v2 DB.
+
+### 20.7 Deploy notes & known limits
+
+1. **Run the migration** (`npm run migrate`) on each backend DB. Until then the feature is
+   dormant: permission checks keep working role-only, the page loads showing no overrides,
+   and **saving fails with a 500** until the table exists.
+2. **Cache lag across instances:** a save clears Redis and the saving instance's in-memory
+   cache, but another instance can serve its own in-memory context for up to **5 minutes**.
+   Same as role permission changes today.
+3. The affected user's **sidebar** refreshes on reload / next controls fetch; API enforcement
+   follows the cache rule above.
+4. Action-key aliases (`legacyActionAliases`) are not expanded for revokes — revoking one
+   action id does not revoke a different action id that aliases to the same key.
+5. Deleting a user or removing them from the org leaves override rows in place (inert without
+   an active role / membership).
