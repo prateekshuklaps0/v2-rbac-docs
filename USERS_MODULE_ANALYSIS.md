@@ -1,5 +1,5 @@
 # Users / Roles / Permissions Module — Deep Analysis
-> Maintained by AI Agent | Last Updated: 2026-09-15 (Implementation In Progress)
+> Maintained by AI Agent | Last Updated: 2026-10-06 (Implementation In Progress)
 > Branch: `users` | All new work → `v2` folder (backend) and `pages/Admin/v2/` (frontend)
 
 ---
@@ -26,6 +26,7 @@
 18. [One Email, Several `users` Rows — Identity, Duplicates & Super-Admin Accounts](#18-one-email-several-users-rows--identity-duplicates--super-admin-accounts--2026-09-13)
 19. [Super-Admin Portal — Forgot Password, Access Requests, Phone Uniqueness](#19-super-admin-portal--forgot-password-access-requests-phone-uniqueness--2026-09-13)
 20. [Per-User Extra Permissions — Grant / Revoke on Top of Roles](#20-per-user-extra-permissions--grant--revoke-on-top-of-roles--2026-09-15)
+21. [Editing a User's Email — and What Re-Study Turned Up](#21-editing-a-users-email--and-what-re-study-turned-up--2026-10-06)
 
 ---
 
@@ -185,7 +186,7 @@ PROD_DB_*        → production DB (fallbacks to dev if not set)
 
 #### User (models/User.js)
 ```javascript
-id, email (unique), passwordHash, 
+id, email (NOT unique — see §18), passwordHash, 
 role: ENUM('admin','super_admin','student','counsellor','user'),  // LEGACY
 subRole: STRING,       // purpose unclear
 status: ENUM('active','disabled','invited'),
@@ -2918,8 +2919,16 @@ Always pass the **acting** role — `req.user.selectedRoleId` — into anything 
 |---|---|---|
 | `v2/services/manageLeadService.js` | `buildLeadScopeWhere`, `fetchApplicationManager`, `fetchArchiveLeads`, `fetchV2LeadsForExport` | lead list, applicants, archive, export. `bulkLeadResolver` + bulk workers inherit via `buildLeadScopeWhere` |
 | `v2/services/adminDashboardV2Service.js` | `resolveVisibleCounsellorIds` → `applyCounsellorScope` / `buildScopeSql` | deliberately mirrors the lead list so a tile and the listing can never disagree |
-| `v2/services/calendar.service.js` | `getCalendarEventsForUserAndReporting` | |
-| `services/userDashboard.service.js` | 2 sites | |
+| `v2/services/leadUploadService.js` | — | added after this section was first written |
+| `services/customDashboardService.js` | — | added after this section was first written |
+| `services/manageDeletedLeadsService.js` | — | added after this section was first written |
+| `v2/services/calendar.service.js` | `getCalendarEventsForUserAndReporting` | via `listUsersManagedByUser`, not `resolveActorVisibility` |
+| `services/userDashboard.service.js` | 2 sites | via `listUsersManagedByUser`, not `resolveActorVisibility` |
+
+> Verified 2026-10-06. This table drifts: three surfaces were added without it being
+> updated. To re-check, `grep -rn "resolveActorVisibility" src/` — every lead-bearing
+> hit should be listed above, and any lead surface *missing* from that grep is
+> unscoped and needs looking at.
 
 Dashboard cache keys include `roleKey` + `userKey`, so two roles can never share a cached scope. **Purge after any change here** (`GET /api/internal/cache/purge-lm?key=kms4000&prefix=lmapicache:dashboard:v2:`); `rbacService` also holds a 5-minute in-process cache that no endpoint can reach.
 
@@ -3808,9 +3817,12 @@ Redis. **52/52 pass**, including:
 
 ### 20.7 Deploy notes & known limits
 
-1. **Run the migration** (`npm run migrate`) on each backend DB. Until then the feature is
-   dormant: permission checks keep working role-only, the page loads showing no overrides,
-   and **saving fails with a 500** until the table exists.
+1. **Run the migration by name**, on each backend DB:
+   `npx sequelize-cli db:migrate --name 20260920120000-create-user-action-overrides.cjs`.
+   Never a command that runs every pending migration — that is forbidden on this project,
+   and a safety hook blocks it. Until the table exists the feature is dormant: permission
+   checks keep working role-only, the page loads showing no overrides, and **saving fails
+   with a 500**.
 2. **Cache lag across instances:** a save clears Redis and the saving instance's in-memory
    cache, but another instance can serve its own in-memory context for up to **5 minutes**.
    Same as role permission changes today.
@@ -3820,3 +3832,93 @@ Redis. **52/52 pass**, including:
    action id does not revoke a different action id that aliases to the same key.
 5. Deleting a user or removing them from the org leaves override rows in place (inert without
    an active role / membership).
+
+---
+
+## 21. Editing a User's Email — and What Re-Study Turned Up — 2026-10-06
+
+### 21.1 Fixed — "User updated", email unchanged
+
+**Symptom.** Manage Users → row → Edit → change the email → Save. The API returned
+`200 {"success":true,"message":"User updated"}` and the response body echoed the
+**old** address. Nothing in the DB changed. Reported against
+`PATCH /api/v2/org/12/rbac/users/4888920`.
+
+**Cause.** `userService.updateUser` destructured the payload as
+`{ name, phone, countryCode, status, publisherSource, roleIds, schoolIds, programIds, formIds, managerIds }`
+— `email` was never in that list. The field was read off the request and dropped on
+the floor; the success response then returned `result.email`, i.e. the untouched DB
+value. No error, because nothing ever tried to write it.
+
+**Fix.** `email` added to the destructure, and handled inside the existing transaction:
+
+```js
+if (email !== undefined) {
+  const normalizedEmail = String(email).trim().toLowerCase();
+  if (!normalizedEmail) throw new ApiError(httpStatus.BAD_REQUEST, 'email cannot be empty');
+  if (normalizedEmail !== String(user.email ?? '').toLowerCase()) {
+    await assertAdminEmailAvailable({ email: normalizedEmail, excludeUserId: user.id, transaction });
+    user.email = normalizedEmail;
+  }
+}
+```
+
+`email` was also added to the audit `before`/`after` — `user.update` was recording
+name/phone/status but would have omitted the one field being changed.
+
+### 21.2 Why the uniqueness guard is GLOBAL, not per-org
+
+New util `src/v2/utils/emailUniqueness.js` — `assertAdminEmailAvailable`. It is
+deliberately **not** modelled on `phoneUniqueness.js`, whose header claims it
+"mirrors how email behaves per-org". For email that scope would be wrong:
+
+`adminLoginV2` and the password-reset flow resolve an account with
+`User.findOne({ email, role: { [Op.notIn]: ['student','super_admin'] } })` — **no org
+in the lookup**. Two admin-portal rows sharing an address therefore break login for
+both, whichever orgs they sit in, because the lookup returns an arbitrary one. That
+is §18.3 (the kapish case). A per-org check would have let an email edit recreate it
+across org boundaries.
+
+Scope is admin-portal rows only, so per-portal identity (§18.1) still holds — an
+address living on a student row does not block an admin taking it.
+
+**The case-insensitive no-op matters.** The drawer resubmits the whole form on every
+save, so a bare `normalizedEmail !== user.email` comparison would treat a legacy
+mixed-case row as a change on *every* save, run the guard, and hit 409 against the
+row's own historical twin. Editing only a user's *name* would start failing. So a
+difference that is case-only is left alone rather than silently re-normalised.
+
+### 21.3 Verified (staging, 2026-10-06)
+
+`anandi-v2staging`. Guard — 6/6: rejects an address another admin holds; allows it
+with self excluded; catches an uppercase variant; allows unused; no-ops on empty;
+allows an address held only by a **student** row. End-to-end through the real service
+on a disposable account (`test@61.com`, id 4442123) — 4/4: email actually changed in
+the DB; duplicate rejected 409; case-only resubmit left the stored value alone; empty
+rejected 400. **Account reverted.** ESLint clean (2 pre-existing warnings, untouched
+lines).
+
+### 21.4 Open — found during re-study, NOT fixed
+
+1. **`POST /users/:userId/direct-reports` is gated by `jwtValidator` only.**
+   `v2/routes/index.js:56`, sitting in the super-admin block. No `requireAction`, no
+   `roleValidator`, and `listUsersManagedByUser` has no actor check — `managerUserId`
+   comes straight from the URL, `orgId` is optional (without it the walk spans every
+   org the target has reports in), and `roles` / `schools` / `programs` /
+   `applicationForms` / `organization` / `membership` are client-supplied flags. Any
+   authenticated user can read another user's reporting tree and allocations. Its GET
+   twin at `rbacUsers.routes.js:43` **is** gated with `manage-users.manage-users.view`.
+   Partial mitigation, by accident: `includeRoleHierarchy` is client-supplied too, but
+   the level is resolved by building the RBAC context for the **target** user with the
+   **caller's** `roleId`, so unless they share that role `effectiveLevel` is `null` and
+   the hierarchy expansion yields nothing. The disclosure stands on its own.
+
+2. **`userProfileService` self-profile update writes `email` raw** — `updatePayload.email = email`,
+   no lowercasing, no uniqueness check. The mirror image of 21.1: Manage Users now
+   cannot create a duplicate, but a user editing their own profile still can.
+
+3. **Stale code comment.** `authController.js` (~line 753) says the exact-match email
+   lookup "hits the **unique** btree index on `users.email`". There is no unique index
+   — only `users_email`, `users_email_status`, `users_email_lower_idx`, as §18 states
+   correctly. Behaviourally harmless, but it reads as a guarantee that does not exist.
+   §3's model listing had the same error and was corrected to "NOT unique — see §18".
